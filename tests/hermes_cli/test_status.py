@@ -14,6 +14,20 @@ def test_show_status_includes_tavily_key(monkeypatch, capsys, tmp_path):
     assert "tvly...cdef" in output
 
 
+def test_show_status_all_redacts_api_keys(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-test-secret-1234567890")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-test-secret-1234567890")
+
+    show_status(SimpleNamespace(all=True, deep=False))
+
+    output = capsys.readouterr().out
+    assert "open...7890" in output
+    assert "tavi...7890" in output
+    assert "openrouter-test-secret-1234567890" not in output
+    assert "tavily-test-secret-1234567890" not in output
+
+
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):
     from hermes_cli import status as status_mod
     import hermes_cli.auth as auth_mod
