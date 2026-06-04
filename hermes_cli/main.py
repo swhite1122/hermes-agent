@@ -9206,6 +9206,49 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if is_fork and branch == "main":
             _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
+        # VPS live overlay safety: Shawn's production install runs from a
+        # fork-backed overlay branch (vps/live-secure) that carries local
+        # safety fixes until upstream absorbs them. The historical update path
+        # switches to main, pulls upstream, then continues on main; that drops
+        # the overlay and makes every successful update look like a regression.
+        # If update was launched from a vps/* overlay, rebase it onto the freshly
+        # updated target branch before dependency installs/restarts so the live
+        # checkout stays on the overlay instead of silently falling back to main.
+        if current_branch not in {branch, "HEAD"} and current_branch.startswith("vps/"):
+            print()
+            print(f"→ Restoring VPS live overlay branch {current_branch}...")
+            checkout_overlay = subprocess.run(
+                git_cmd + ["checkout", current_branch],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if checkout_overlay.returncode != 0:
+                print(f"✗ Updated {branch}, but could not return to {current_branch}.")
+                if checkout_overlay.stderr.strip():
+                    print(f"  {checkout_overlay.stderr.strip().splitlines()[0]}")
+                print(f"  Recover manually: cd {PROJECT_ROOT} && git checkout {current_branch}")
+                sys.exit(1)
+            rebase_overlay = subprocess.run(
+                git_cmd + ["rebase", branch],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if rebase_overlay.returncode != 0:
+                subprocess.run(
+                    git_cmd + ["rebase", "--abort"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                print(f"✗ Updated {branch}, but rebasing {current_branch} onto it conflicted.")
+                if rebase_overlay.stderr.strip():
+                    print(f"  {rebase_overlay.stderr.strip().splitlines()[0]}")
+                print("  Main is updated; the live overlay was left unchanged for manual repair.")
+                sys.exit(1)
+            print(f"  ✓ {current_branch} rebased onto {branch}")
+
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras
         # individually so update does not silently strip working capabilities.
