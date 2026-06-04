@@ -15953,6 +15953,16 @@ def main(
     except Exception:
         pass  # signal handler may fail in restricted environments
     
+    def _quiet_single_query_exit(code: int = 0) -> None:
+        # Avoid late interpreter teardown crashes in one-shot quiet mode.
+        # The response and session id have already been printed by this point.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(code)
+
     # Handle single query mode
     if query or image:
         query, single_query_images = _collect_query_images(query, image)
@@ -16142,10 +16152,10 @@ def main(
                                 _exit_code = _RL_CODE
                             except Exception:
                                 _exit_code = 1
-                    sys.exit(_exit_code)
+                    _quiet_single_query_exit(_exit_code)
             
-            # Exit with error code if credentials or agent init fails
-            sys.exit(1)
+            # Exit with error code if credentials or agent init fails.
+            _quiet_single_query_exit(1)
         else:
             # Single-query mode (`hermes chat -q "…"`): skip the welcome
             # banner. Building the banner takes ~420 ms on cold start —
