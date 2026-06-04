@@ -149,7 +149,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "platform.slack": (
         "slack-bolt==1.27.0",
         "slack-sdk==3.40.1",
-        "aiohttp==3.13.4",  # CVE-2026-34513/34518/34519/34520/34525
+        "aiohttp==3.14.0",  # security floor for GHSA-hg6j-4rv6-33pg / GHSA-jg22-mg44-37j8
     ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.0",
