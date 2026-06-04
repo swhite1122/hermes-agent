@@ -122,6 +122,12 @@ except Exception:
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
+try:
+    from agent.memory_manager import sanitize_context as _sanitize_memory_context
+except Exception:  # pragma: no cover - defensive fallback for broken imports
+    def _sanitize_memory_context(text: str) -> str:
+        return text
+
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
@@ -162,6 +168,23 @@ except (ValueError, TypeError):
 _WS_ORPHAN_REAP_GRACE_S = max(0.0, _ws_orphan_reap_grace)
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
+
+
+def _display_text(text: Any) -> str:
+    """Return text safe to render in TUI/Desktop message surfaces.
+
+    Memory providers inject recalled context into the model input inside
+    <memory-context> fences. The core streaming path scrubs those deltas, but
+    Dashboard/TUI also hydrates messages from history and emits a final
+    message.complete payload. Keep those display-only paths defensive too so a
+    provider echo cannot expose raw recalled memory in the UI.
+    """
+    if text is None:
+        return ""
+    try:
+        return _sanitize_memory_context(str(text))
+    except Exception:
+        return str(text)
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
@@ -3540,7 +3563,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
             continue
-        content_text = _coerce_message_text(m.get("content"))
+        content_text = _display_text(_coerce_message_text(m.get("content")))
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -5715,7 +5738,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     sid, session, clear_pending_title=False, restart_slash_worker=True,
                 )
 
-                raw = result.get("final_response", "")
+                raw = _display_text(result.get("final_response", ""))
                 status = (
                     "interrupted"
                     if result.get("interrupted")
@@ -5737,7 +5760,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
             else:
-                raw = str(result)
+                raw = _display_text(result)
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
