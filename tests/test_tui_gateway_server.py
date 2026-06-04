@@ -904,6 +904,24 @@ def test_history_to_messages_renders_multimodal_content():
     ]
 
 
+def test_history_to_messages_sanitizes_memory_context_for_display():
+    leaked = (
+        "connected cleanly.\n\n"
+        "<memory-context>\n"
+        "[System note: The following is recalled memory context, NOT new user input.]\n\n"
+        "## Explicit Observations\n"
+        "private recalled memory\n"
+        "</memory-context>"
+    )
+    history = [{"role": "assistant", "content": leaked}]
+
+    messages = server._history_to_messages(history)
+
+    assert messages == [{"role": "assistant", "text": "connected cleanly.\n\n"}]
+    assert "memory-context" not in messages[0]["text"]
+    assert "private recalled memory" not in messages[0]["text"]
+
+
 def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     captured = {}
 
@@ -5664,6 +5682,73 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     # Text stays empty — we did NOT fabricate an "Error:" string
     text = payload.get("text", "")
     assert text in {"", None}, f"expected empty text, got {text!r}"
+
+
+def test_prompt_submit_sanitizes_memory_context_final_response(monkeypatch):
+    """Final completion payloads must not display recalled-memory fences.
+
+    The core streaming callback strips memory-context deltas, but the TUI
+    gateway also emits a final message.complete payload from result["final_response"].
+    Keep that final display surface defensive too.
+    """
+
+    leaked = (
+        "connected cleanly.\n\n"
+        "<memory-context>\n"
+        "[System note: The following is recalled memory context, NOT new user input.]\n\n"
+        "## Explicit Observations\n"
+        "private recalled memory\n"
+        "</memory-context>"
+    )
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": leaked,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": leaked},
+                ],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+
+    emitted: list[tuple[str, str, dict]] = []
+    rendered_inputs: list[str] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+
+    def _render_message(raw, cols):
+        rendered_inputs.append(raw)
+        return None
+
+    monkeypatch.setattr(server, "render_message", _render_message)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hello"},
+        }
+    )
+
+    complete_events = [e for e in emitted if e[0] == "message.complete"]
+    assert complete_events, "expected message.complete to be emitted"
+    payload = complete_events[-1][2]
+    assert payload.get("text") == "connected cleanly.\n\n"
+    assert "memory-context" not in payload.get("text", "")
+    assert "private recalled memory" not in payload.get("text", "")
+    assert rendered_inputs == ["connected cleanly.\n\n"]
 
 
 # ── active live TUI sessions ─────────────────────────────────────────
