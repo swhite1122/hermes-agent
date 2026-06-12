@@ -305,6 +305,21 @@ def check_for_updates() -> Optional[int]:
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    repo_dir: Optional[Path] = None
+    cache_rev = embedded_rev
+
+    # Source installs move independently of VERSION. Cache update checks by
+    # the actual running git HEAD, not just by package version, or a manual
+    # rebase/overlay repair can leave a stale "N commits behind" banner until
+    # the 6-hour cache TTL expires.
+    if not embedded_rev:
+        try:
+            repo_dir = _resolve_repo_dir()
+            if repo_dir is not None:
+                cache_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+        except Exception:
+            repo_dir = None
+            cache_rev = None
 
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
@@ -325,18 +340,20 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Read cache — invalidate if the embedded rev OR installed version has
+    # Read cache — invalidate if the source rev OR installed version has
     # changed since the last check. The version guard matters for pip installs:
     # `check_via_pypi()` compares against VERSION, so a `pip install --upgrade`
     # changes VERSION but leaves rev unchanged (both None), and without this
     # the stale "behind" count would survive the upgrade for up to 6h. See #34491.
+    # For git installs, cache_rev is the running HEAD so overlay rebases/manual
+    # branch repairs cannot keep showing an old behind count.
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-                and cached.get("rev") == embedded_rev
+                and cached.get("rev") == cache_rev
                 and cached.get("ver") == VERSION
             ):
                 return cached.get("behind")
@@ -346,20 +363,16 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
+        if repo_dir is None:
+            repo_dir = _resolve_repo_dir()
+        if repo_dir is None:
             behind = check_via_pypi()
         else:
             behind = _check_via_local_git(repo_dir)
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
+            json.dumps({"ts": now, "behind": behind, "rev": cache_rev, "ver": VERSION})
         )
     except Exception:
         pass
