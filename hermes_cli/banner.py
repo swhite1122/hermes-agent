@@ -280,19 +280,6 @@ def check_for_updates() -> Optional[int]:
     repo_dir: Optional[Path] = None
     cache_rev = embedded_rev
 
-    # Source installs move independently of VERSION. Cache update checks by
-    # the actual running git HEAD, not just by package version, or a manual
-    # rebase/overlay repair can leave a stale "N commits behind" banner until
-    # the 6-hour cache TTL expires.
-    if not embedded_rev:
-        try:
-            repo_dir = _resolve_repo_dir()
-            if repo_dir is not None:
-                cache_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        except Exception:
-            repo_dir = None
-            cache_rev = None
-
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
     # HERMES_REVISION (that's nix-only). Without this guard the checks below
@@ -305,12 +292,27 @@ def check_for_updates() -> Optional[int]:
     # mirror that here so the banner/TUI surfaces agree. Returning None makes
     # both the Rich banner (build_welcome_banner) and the Ink badge
     # (branding.tsx, guarded on `typeof === 'number' && > 0`) show nothing.
+    # Keep this before any source-rev cache probing so Docker never shells out
+    # to git just to decide that update checks do not apply.
     try:
         from hermes_cli.config import detect_install_method
         if detect_install_method() == "docker":
             return None
     except Exception:
         pass
+
+    # Source installs move independently of VERSION. Cache update checks by
+    # the actual running git HEAD, not just by package version, or a manual
+    # rebase/overlay repair can leave a stale "N commits behind" banner until
+    # the 6-hour cache TTL expires.
+    if not embedded_rev:
+        try:
+            repo_dir = _resolve_repo_dir()
+            if repo_dir is not None:
+                cache_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+        except Exception:
+            repo_dir = None
+            cache_rev = None
 
     # Read cache — invalidate if the source rev OR installed version has
     # changed since the last check. The version guard matters for pip installs:
