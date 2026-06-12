@@ -1,3 +1,5 @@
+import json
+import time
 from unittest.mock import MagicMock, patch
 
 
@@ -114,3 +116,48 @@ def test_get_git_banner_state_falls_back_when_live_git_returns_nothing(tmp_path)
         state = banner.get_git_banner_state(repo_dir)
 
     assert state == {"upstream": "cafef00d", "local": "cafef00d", "ahead": 0}
+
+
+def test_check_for_updates_cache_key_uses_local_git_head(tmp_path, monkeypatch):
+    """Source installs must not reuse stale behind-count cache after HEAD moves."""
+    from hermes_cli import banner
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+    cache_file = home / ".update_check"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 208,
+                "rev": "old-head",
+                "ver": banner.VERSION,
+            }
+        )
+    )
+
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+    monkeypatch.setattr(banner, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(banner, "_resolve_repo_dir", lambda: repo_dir)
+    monkeypatch.setattr(
+        banner,
+        "_git_stdout",
+        lambda args, cwd=None, timeout=5: "new-head" if args == ["rev-parse", "HEAD"] else None,
+    )
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *a, **kw: "git")
+
+    checked = []
+    monkeypatch.setattr(
+        banner,
+        "_check_via_local_git",
+        lambda path: checked.append(path) or 0,
+    )
+
+    assert banner.check_for_updates() == 0
+    assert checked == [repo_dir]
+
+    cached = json.loads(cache_file.read_text())
+    assert cached["behind"] == 0
+    assert cached["rev"] == "new-head"
