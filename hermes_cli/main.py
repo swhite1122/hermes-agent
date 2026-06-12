@@ -8800,23 +8800,70 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if is_fork and branch == "main":
                 _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
+            # VPS live overlay safety must also run when the target branch is
+            # already current. Otherwise a previous half-update can leave
+            # vps/live-secure behind origin/main forever while `hermes update`
+            # reports "Already up to date" after checking only main.
+            if current_branch not in {branch, "HEAD"} and current_branch.startswith("vps/"):
+                print()
+                print(f"→ Restoring VPS live overlay branch {current_branch}...")
+                checkout_overlay = subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
-                    check=False,
                 )
+                if checkout_overlay.returncode != 0:
+                    print(f"✗ {branch} is up to date, but could not return to {current_branch}.")
+                    if checkout_overlay.stderr.strip():
+                        print(f"  {checkout_overlay.stderr.strip().splitlines()[0]}")
+                    print(f"  Recover manually: cd {PROJECT_ROOT} && git checkout {current_branch}")
+                    sys.exit(1)
+                rebase_overlay = subprocess.run(
+                    git_cmd + ["rebase", branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if rebase_overlay.returncode != 0:
+                    subprocess.run(
+                        git_cmd + ["rebase", "--abort"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    print(f"✗ {branch} is up to date, but rebasing {current_branch} onto it conflicted.")
+                    if rebase_overlay.stderr.strip():
+                        print(f"  {rebase_overlay.stderr.strip().splitlines()[0]}")
+                    print("  The live overlay was left unchanged for manual repair.")
+                    sys.exit(1)
+                print(f"  ✓ {current_branch} rebased onto {branch}")
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+            else:
+                # Restore stash and switch back to original branch if we moved
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                if current_branch not in {branch, "HEAD"}:
+                    subprocess.run(
+                        git_cmd + ["checkout", current_branch],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
             print("✓ Already up to date!")
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
