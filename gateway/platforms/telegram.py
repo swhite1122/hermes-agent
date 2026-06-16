@@ -422,10 +422,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
         # path degrades (tables → bullet lists, task lists, <details>, block
         # math) via sendRichMessage / editMessageText's rich_message param using
-        # the raw agent markdown. Enabled by default; users can opt out for
-        # clients that accept but render rich messages poorly via
-        # platforms.telegram.extra.rich_messages: false.
-        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", True)
+        # the raw agent markdown. Keep this opt-in because Telegram rich
+        # messages can render with visibly different typography than normal bot
+        # messages on some clients. Enable via
+        # platforms.telegram.extra.rich_messages: true.
+        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -1013,7 +1014,7 @@ class TelegramAdapter(BasePlatformAdapter):
         FINAL edit should still upgrade to rich when the content warrants it.
         """
         return bool(
-            getattr(self, "_rich_messages_enabled", True)
+            getattr(self, "_rich_messages_enabled", False)
             and not getattr(self, "_rich_send_disabled", False)
             and content
             and content.strip()
@@ -1058,7 +1059,7 @@ class TelegramAdapter(BasePlatformAdapter):
         streams split exactly as before.
         """
         if (
-            getattr(self, "_rich_messages_enabled", True)
+            getattr(self, "_rich_messages_enabled", False)
             and not getattr(self, "_rich_send_disabled", False)
             and self._bot_supports_rich()
         ):
@@ -1321,7 +1322,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
-            getattr(self, "_rich_messages_enabled", True)
+            getattr(self, "_rich_messages_enabled", False)
             and not getattr(self, "_rich_send_disabled", False)
             and not getattr(self, "_rich_draft_disabled", False)
             and content
