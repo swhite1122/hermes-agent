@@ -186,10 +186,9 @@ async def test_rich_messages_opt_out_accepts_string_false():
 
 
 @pytest.mark.asyncio
-async def test_rich_messages_default_is_enabled():
-    """Rich messages are on by default (Bot API 10.1); rich-eligible content
-    (tables/task lists/details/math) goes through sendRichMessage without the
-    user having to opt in."""
+async def test_rich_messages_default_disabled_uses_legacy_path():
+    """Rich messages stay opt-in so clients with different rich-message
+    typography keep the normal MarkdownV2 send path by default."""
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = TelegramAdapter(config)
     bot = MagicMock()
@@ -203,8 +202,8 @@ async def test_rich_messages_default_is_enabled():
     assert result.success is True
     bot = adapter._bot
     assert bot is not None
-    bot.do_api_request.assert_awaited_once()
-    bot.send_message.assert_not_called()
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
 
 
 @pytest.mark.asyncio
