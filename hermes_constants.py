@@ -570,14 +570,19 @@ def is_container() -> bool:
     except OSError:
         pass
     # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
-    # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
+    # runtime may still show up on THIS process's root mount (overlay rootfs,
+    # runtime mount paths). Do not scan the entire mount table: hosts running
+    # Docker/containerd can have child container mounts under /var/lib/docker
+    # even though Hermes itself is running on the host.
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
-                _container_detected = True
-                return True
+            for line in f:
+                fields = line.split()
+                if len(fields) > 4 and fields[4] == "/" and any(
+                    marker in line for marker in ("kubepods", "containerd", "crio")
+                ):
+                    _container_detected = True
+                    return True
     except OSError:
         pass
     _container_detected = False
