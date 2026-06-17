@@ -157,6 +157,33 @@ class TestIsContainer:
         monkeypatch.setattr("builtins.open", _fake_open)
         assert is_container() is False
 
+    def test_host_with_docker_mounts_is_not_container(self, monkeypatch, tmp_path):
+        """Host mount tables can include child container mounts without this process being in one."""
+        import builtins
+
+        self._reset_cache(monkeypatch)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        cgroup_file = tmp_path / "cgroup"
+        cgroup_file.write_text("0::/\n")
+        mountinfo_file = tmp_path / "mountinfo"
+        mountinfo_file.write_text(
+            "29 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+            "322 29 0:48 / /var/lib/docker/rootfs/overlayfs/abc rw,relatime shared:273 "
+            "- overlay overlay rw,lowerdir=/var/lib/containerd/snapshots/93/fs\n"
+        )
+        _real_open = builtins.open
+
+        def _fake_open(p, *a, **kw):
+            if p == "/proc/1/cgroup":
+                return _real_open(str(cgroup_file), *a, **kw)
+            if p == "/proc/self/mountinfo":
+                return _real_open(str(mountinfo_file), *a, **kw)
+            return _real_open(p, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", _fake_open)
+        assert is_container() is False
+
     def test_detects_kubernetes_env(self, monkeypatch):
         """KUBERNETES_SERVICE_HOST env var triggers detection (k8s/k3s pod)."""
         self._reset_cache(monkeypatch)
