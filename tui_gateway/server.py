@@ -123,8 +123,13 @@ except Exception:
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 try:
-    from agent.memory_manager import sanitize_context as _sanitize_memory_context
+    from agent.memory_manager import (
+        StreamingContextScrubber as _MemoryContextScrubber,
+        sanitize_context as _sanitize_memory_context,
+    )
 except Exception:  # pragma: no cover - defensive fallback for broken imports
+    _MemoryContextScrubber = None
+
     def _sanitize_memory_context(text: str) -> str:
         return text
 
@@ -185,6 +190,42 @@ def _display_text(text: Any) -> str:
         return _sanitize_memory_context(str(text))
     except Exception:
         return str(text)
+
+
+def _new_display_scrubber() -> Any:
+    """Create a stateful display scrubber for split streaming deltas."""
+    if _MemoryContextScrubber is None:
+        return None
+    try:
+        return _MemoryContextScrubber()
+    except Exception:
+        return None
+
+
+def _stream_display_text(scrubber: Any, text: Any) -> str:
+    """Scrub one streaming chunk before it reaches TUI/Desktop renderers."""
+    if text is None:
+        return ""
+    raw = str(text)
+    if not raw:
+        return ""
+    if scrubber is not None:
+        try:
+            return scrubber.feed(raw)
+        except Exception:
+            pass
+    return _display_text(raw)
+
+
+def _flush_stream_display_text(scrubber: Any) -> str:
+    """Flush held partial-tag text at the end of a display stream."""
+    if scrubber is None:
+        return ""
+    try:
+        return _display_text(scrubber.flush())
+    except Exception:
+        return ""
+
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
@@ -3396,7 +3437,15 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
         return
     csid = live[0]
     with _child_mirrors_lock:
-        st = _child_mirrors.setdefault(child_key, {"seq": 0, "open_tool": None, "started": False})
+        st = _child_mirrors.setdefault(
+            child_key,
+            {
+                "seq": 0,
+                "open_tool": None,
+                "started": False,
+                "scrubber": _new_display_scrubber(),
+            },
+        )
         if not st["started"]:
             st["started"] = True
             _emit("message.start", csid)
@@ -3407,7 +3456,7 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             # The child's streamed reply text — the actual "agent talking".
             # Relayed token-by-token from the child's run_conversation
             # stream_callback, so the watch window streams the reply live.
-            if text := str(payload.get("text") or ""):
+            if text := _stream_display_text(st.get("scrubber"), payload.get("text")):
                 _emit("message.delta", csid, {"text": text})
         elif event_type == "subagent.start":
             # One-time header line (the child's goal) so a freshly opened window
@@ -3430,7 +3479,9 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
         elif event_type == "subagent.complete":
             if st["open_tool"]:
                 _emit("tool.complete", csid, st["open_tool"])
-            summary = str(payload.get("summary") or payload.get("text") or "")
+            if tail := _flush_stream_display_text(st.get("scrubber")):
+                _emit("message.delta", csid, {"text": tail})
+            summary = _display_text(payload.get("summary") or payload.get("text") or "")
             _emit("message.complete", csid, {"text": summary})
             _child_mirrors.pop(child_key, None)
 
@@ -8168,13 +8219,21 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 else:
                     run_message = _enrich_with_attached_images(prompt, images)
 
-            def _stream(delta):
+            stream_scrubber = _new_display_scrubber()
+
+            def _emit_stream_delta(delta: Any) -> None:
+                visible = _stream_display_text(stream_scrubber, delta)
+                if not visible:
+                    return
                 with session["history_lock"]:
-                    _append_inflight_delta(session, delta)
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
+                    _append_inflight_delta(session, visible)
+                payload = {"text": visible}
+                if streamer and (r := streamer.feed(visible)) is not None:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
+
+            def _stream(delta):
+                _emit_stream_delta(delta)
 
             run_kwargs = {
                 "conversation_history": list(history),
@@ -8186,6 +8245,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
+            _emit_stream_delta(_flush_stream_display_text(stream_scrubber))
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 if _restore is None:
@@ -9115,7 +9175,7 @@ def _(rid, params: dict) -> dict:
                 parent,
                 {
                     "task_id": task_id,
-                    "text": (
+                    "text": _display_text(
                         result.get("final_response", str(result))
                         if isinstance(result, dict)
                         else str(result)
@@ -9223,7 +9283,7 @@ def _(rid, params: dict) -> dict:
                 task_id=task_id,
                 conversation_history=parent_history or None,
             )
-            text = (
+            text = _display_text(
                 result.get("final_response", str(result))
                 if isinstance(result, dict)
                 else str(result)

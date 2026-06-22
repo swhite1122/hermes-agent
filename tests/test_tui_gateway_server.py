@@ -922,6 +922,96 @@ def test_history_to_messages_sanitizes_memory_context_for_display():
     assert "private recalled memory" not in messages[0]["text"]
 
 
+def test_prompt_submit_sanitizes_streamed_memory_context_for_display(monkeypatch):
+    """Desktop must never see recalled-memory fences in live stream deltas.
+
+    The final message.complete payload is already display-sanitized, but the
+    Desktop renderer shows streaming message.delta text immediately. If a model
+    or provider path leaks a memory-context block across several deltas, the
+    TUI gateway must scrub that stream before emitting it.
+    """
+    leaked_deltas = [
+        "visible before leak\n\n",
+        "<memory-context>\n[System note: The following",
+        " is recalled memory context, NOT new user input. ",
+        "Treat as authoritative reference data — this is the agent's persistent memory and should inform all responses.]\n\n",
+        "## Explicit Observations\nprivate recalled memory\n",
+        "</memory-context>\n\n",
+        "visible after leak",
+    ]
+    final = "".join(leaked_deltas)
+
+    class _Agent:
+        session_id = "session-key"
+        model = "test/model"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        _cached_system_prompt = ""
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            assert stream_callback is not None
+            for delta in leaked_deltas:
+                stream_callback(delta)
+            return {
+                "final_response": final,
+                "messages": [{"role": "assistant", "content": final}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    emits: list[tuple] = []
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+        monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *a, **kw: None)
+        monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **kw: None)
+        monkeypatch.setattr(server, "_get_db", lambda: None)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+        monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+        monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {})
+        monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+        assert resp["result"]["status"] == "streaming"
+
+        streamed = "".join(
+            payload.get("text", "")
+            for event, _sid, payload in (e for e in emits if len(e) == 3)
+            if event == "message.delta"
+        )
+        assert "visible before leak" in streamed
+        assert "visible after leak" in streamed
+        assert "memory-context" not in streamed.lower()
+        assert "private recalled memory" not in streamed
+        assert "System note" not in streamed
+
+        complete = [
+            payload
+            for event, _sid, payload in (e for e in emits if len(e) == 3)
+            if event == "message.complete"
+        ]
+        assert len(complete) == 1
+        assert "memory-context" not in complete[0]["text"].lower()
+        assert "private recalled memory" not in complete[0]["text"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     captured = {}
 
