@@ -2440,6 +2440,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Whether this profile's gateway should run the cron scheduler loop.
+        # Profiles that should chat but never execute shared cron jobs can set
+        # this false while leaving the default/root profile as the sole runner.
+        "enabled": True,
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or
