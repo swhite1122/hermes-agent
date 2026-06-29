@@ -58,6 +58,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import { sendTextWithMarkdownFallback } from "./send-text-fallback.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -728,11 +729,13 @@ const server = http.createServer(async (req, res) => {
         return badRequest(res, "format must be text or markdown");
       }
       const space = await resolveSpace(spaceId);
-      // iMessage renders markdown natively; spectrum-ts degrades it to
-      // readable plain text on platforms that don't.
-      const builder =
-        format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
-      const result = await space.send(builder);
+      // iMessage renders markdown natively when possible. Some Photon iMessage
+      // send paths reject spectrum-ts' link data-detection option, so the helper
+      // retries linked markdown as plain text instead of losing the response.
+      const result = await sendTextWithMarkdownFallback(space, text, format, {
+        spectrumText,
+        spectrumMarkdown,
+      });
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-attachment") {
