@@ -21,6 +21,12 @@ from plugins.platforms.photon.adapter import PhotonAdapter
 def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
     monkeypatch.setenv("PHOTON_PROJECT_ID", "test-project-id")
     monkeypatch.setenv("PHOTON_PROJECT_SECRET", "test-project-secret")
+    # Gateway tests import config paths that can load the live .env during
+    # collection; keep inbound parsing tests independent of Shawn's production
+    # PHOTON_REQUIRE_MENTION defaults. Mention-gating behavior has dedicated
+    # coverage in test_mention_gating.py.
+    monkeypatch.delenv("PHOTON_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("PHOTON_MENTION_PATTERNS", raising=False)
     cfg = PlatformConfig(enabled=True, token="", extra={})
     return PhotonAdapter(cfg)
 

@@ -35,9 +35,10 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 
 if TYPE_CHECKING:
     # Type checkers see ``httpx`` as the always-imported module, so every use
@@ -85,6 +86,51 @@ _DEDUP_WINDOW_SECONDS = 48 * 3600
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 
+
+def _hermes_home() -> Path:
+    """Resolve the active Hermes home for Photon runtime files."""
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
+
+def _sidecar_token_path() -> Path:
+    return _hermes_home() / "photon-sidecar-token"
+
+
+def _load_or_create_sidecar_token() -> str:
+    """Return a stable local sidecar token shared across adapter reconnects.
+
+    In-flight gateway turns may hold a PhotonAdapter instance whose persistent
+    HTTP client was closed while the reconnect watcher created a fresh adapter
+    and sidecar. A per-adapter random token means that old instance cannot send
+    the final response through the new loopback sidecar. Persist a local-only
+    bearer token so reconnects keep the same loopback auth secret.
+    """
+    path = _sidecar_token_path()
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+        if len(token) >= 32:
+            return token
+    except OSError:
+        pass
+    token = secrets.token_hex(16)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(token + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(path)
+    except OSError:
+        logger.warning("[photon] could not persist sidecar token at %s", path)
+    return token
+
+
 # Photon / Envoy / spectrum-ts error substrings that indicate a transient
 # upstream overload rather than a permanent failure.  These are not in the
 # core _RETRYABLE_ERROR_PATTERNS because they are specific to this adapter.
@@ -96,12 +142,20 @@ _PHOTON_RETRYABLE_PATTERNS = (
     "reset reason: overflow",
     "upstream_overflow",
     "upstream_unavailable",
+    "rate limited",
+    "rate_limited",
 )
 
-# Minimum seconds between typing-indicator calls for the same chat.
-# iMessage is a personal channel — suppressing rapid repeats reduces
-# upstream gRPC pressure during Photon overflow events.
-_TYPING_COOLDOWN_SECONDS = 5.0
+_PHOTON_RETRY_AFTER_RE = re.compile(r"retry\s+after\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+_PHOTON_RATE_LIMIT_COOLDOWN_FLOOR_SECONDS = 15 * 60
+_PHOTON_STREAM_RESTART_FALLBACK_MS = 90 * 1000
+
+# Photon typing indicators are intentionally disabled for now. On Shawn's live
+# VPS the least reliable upstream path has been `setTyping` (start/stop), and
+# those cosmetic calls land in the same Photon/iMessage upstream as real sends.
+# Dropping them removes two extra upstream calls from every agent turn while
+# preserving text/media delivery.
+_PHOTON_TYPING_ENABLED = False
 
 # Group-chat mention wake words. When ``require_mention`` is enabled, group
 # messages are ignored unless they match one of these patterns — same
@@ -224,7 +278,7 @@ class PhotonAdapter(BasePlatformAdapter):
         )
         self._sidecar_bind = _DEFAULT_SIDECAR_BIND
         self._sidecar_token = (
-            os.getenv("PHOTON_SIDECAR_TOKEN") or secrets.token_hex(16)
+            os.getenv("PHOTON_SIDECAR_TOKEN") or _load_or_create_sidecar_token()
         )
         self._autostart_sidecar = str(
             os.getenv("PHOTON_SIDECAR_AUTOSTART", "true")
@@ -243,6 +297,8 @@ class PhotonAdapter(BasePlatformAdapter):
         self._inbound_running = False
         self._http_client: Optional["httpx.AsyncClient"] = None
         self._sidecar_health_interval = 15.0
+        self._sidecar_recent_lines: Deque[str] = deque(maxlen=60)
+        self.retry_after_seconds: Optional[float] = None
         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
         # may see the same messageId more than once (e.g. after a reconnect).
         self._seen_messages: Dict[str, float] = {}
@@ -358,8 +414,11 @@ class PhotonAdapter(BasePlatformAdapter):
             try:
                 await self._start_sidecar()
             except Exception as e:
+                retry_after = self.retry_after_seconds or self._rate_limit_retry_after_seconds(str(e))
+                if retry_after is not None:
+                    self.retry_after_seconds = retry_after
                 self._set_fatal_error(
-                    "SIDECAR_FAILED",
+                    "PHOTON_RATE_LIMITED" if retry_after is not None else "SIDECAR_FAILED",
                     f"failed to start Photon sidecar: {e}",
                     retryable=True,
                 )
@@ -484,11 +543,29 @@ class PhotonAdapter(BasePlatformAdapter):
                 continue
 
             state = str(stream.get("state") or "unknown")
-            degraded_for_ms = stream.get("degradedForMs")
+            degraded_for_raw = stream.get("degradedForMs")
+            try:
+                degraded_for_ms = float(degraded_for_raw or 0)
+            except (TypeError, ValueError):
+                degraded_for_ms = 0.0
+            restart_after_raw = stream.get("restartAfterMs")
+            try:
+                restart_after_ms = float(restart_after_raw or _PHOTON_STREAM_RESTART_FALLBACK_MS)
+            except (TypeError, ValueError):
+                restart_after_ms = float(_PHOTON_STREAM_RESTART_FALLBACK_MS)
             last_issue = str(stream.get("lastIssue") or "unknown stream issue")
+            if restart_after_ms > 0 and degraded_for_ms < restart_after_ms:
+                logger.warning(
+                    "[photon] upstream stream degraded for %.0fms; waiting for "
+                    "sidecar recovery window %.0fms before reconnecting: %s",
+                    degraded_for_ms,
+                    restart_after_ms,
+                    last_issue,
+                )
+                continue
             message = (
                 "Photon upstream stream degraded"
-                f" (state={state}, degradedForMs={degraded_for_ms}): "
+                f" (state={state}, degradedForMs={degraded_for_raw}): "
                 f"{last_issue}"
             )
             logger.error("[photon] %s", message)
@@ -835,6 +912,15 @@ class PhotonAdapter(BasePlatformAdapter):
                 f"PHOTON_SIDECAR_PORT to a different port"
             )
 
+    def _record_sidecar_output(self, line: str) -> None:
+        self._sidecar_recent_lines.append(line)
+        retry_after = self._rate_limit_retry_after_seconds(line)
+        if retry_after is not None:
+            self.retry_after_seconds = max(self.retry_after_seconds or 0.0, retry_after)
+
+    def _sidecar_output_tail(self) -> str:
+        return "\n".join(self._sidecar_recent_lines)[-1200:]
+
     async def _start_sidecar(self) -> None:
         if not (_SIDECAR_DIR / "node_modules").exists():
             raise RuntimeError(
@@ -897,9 +983,16 @@ class PhotonAdapter(BasePlatformAdapter):
         async with httpx.AsyncClient(timeout=2.0) as client:
             while time.time() < deadline:
                 if self._sidecar_proc.poll() is not None:
+                    # Give the stdout supervisor a beat to drain the crash line
+                    # (notably Photon 429 Retry-After hints) before surfacing
+                    # the startup failure to the gateway reconnect watcher.
+                    await asyncio.sleep(0.05)
+                    tail = self._sidecar_output_tail()
+                    detail = f": {tail}" if tail else ""
                     raise RuntimeError(
                         f"Photon sidecar exited with code "
                         f"{self._sidecar_proc.returncode} before becoming ready"
+                        f"{detail}"
                     )
                 try:
                     resp = await client.post(
@@ -926,7 +1019,9 @@ class PhotonAdapter(BasePlatformAdapter):
                 line = await loop.run_in_executor(None, stdout.readline)
                 if not line:
                     break
-                logger.info("[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip())
+                decoded = line.decode("utf-8", "replace").rstrip()
+                self._record_sidecar_output(decoded)
+                logger.info("[photon-sidecar] %s", decoded)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("[photon-sidecar] supervisor exited: %s", e)
         if self._inbound_running:
@@ -1093,10 +1188,8 @@ class PhotonAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        now = time.time()
-        if now - self._typing_last_sent.get(chat_id, 0.0) < _TYPING_COOLDOWN_SECONDS:
+        if not _PHOTON_TYPING_ENABLED:
             return
-        self._typing_last_sent[chat_id] = now
         try:
             await self._sidecar_call(
                 "/typing", {"spaceId": chat_id, "state": "start"}
@@ -1105,7 +1198,8 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.debug("[photon] send_typing failed: %s", e)
 
     async def stop_typing(self, chat_id: str) -> None:
-        self._typing_last_sent.pop(chat_id, None)
+        if not _PHOTON_TYPING_ENABLED:
+            return
         try:
             await self._sidecar_call(
                 "/typing", {"spaceId": chat_id, "state": "stop"}
@@ -1300,8 +1394,29 @@ class PhotonAdapter(BasePlatformAdapter):
         return strip_markdown(content)
 
     @staticmethod
+    def _rate_limit_retry_after_seconds(error: Optional[str]) -> Optional[float]:
+        if not error:
+            return None
+        text = str(error)
+        lowered = text.lower()
+        if "rate limited" not in lowered and "rate_limited" not in lowered:
+            return None
+        match = _PHOTON_RETRY_AFTER_RE.search(text)
+        retry_after = 60.0
+        if match:
+            try:
+                retry_after = float(match.group(1))
+            except (TypeError, ValueError):
+                retry_after = 60.0
+        if "ip_per_minute" in lowered:
+            return max(retry_after, float(_PHOTON_RATE_LIMIT_COOLDOWN_FLOOR_SECONDS))
+        return max(retry_after, 60.0)
+
+    @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
         if BasePlatformAdapter._is_retryable_error(error):
+            return True
+        if PhotonAdapter._rate_limit_retry_after_seconds(error) is not None:
             return True
         if not error:
             return False
@@ -1314,8 +1429,8 @@ class PhotonAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Any = None,
-        max_retries: int = 1,
-        base_delay: float = 2.0,
+        max_retries: int = 5,
+        base_delay: float = 3.0,
     ) -> SendResult:
         """Retry sends without the generic Markdown banner.
 
@@ -1340,7 +1455,7 @@ class PhotonAdapter(BasePlatformAdapter):
 
         if is_network:
             for attempt in range(1, max_retries + 1):
-                delay = base_delay * (2 ** (attempt - 1))
+                delay = min(base_delay * (2 ** (attempt - 1)), 30.0)
                 logger.warning(
                     "[photon] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     attempt, max_retries, delay, error_str,
@@ -1393,7 +1508,12 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             data = await self._sidecar_call("/send", body)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            error = str(e)
+            return SendResult(
+                success=False,
+                error=error,
+                retryable=self._is_retryable_error(error),
+            )
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
@@ -1447,14 +1567,23 @@ class PhotonAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=data.get("messageId"))
 
     async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        # Guard: adapter not yet connected (no sidecar address known).
-        if self._http_client is None:
-            raise RuntimeError("Photon adapter not connected")
         # Use a fresh client per call so this method is safe when invoked from
         # a worker thread that owns a different event loop than the one the
         # persistent _http_client was created on (e.g. via _run_async in
-        # send_message_tool).  The inbound streaming loop continues to use
+        # send_message_tool). The inbound streaming loop continues to use
         # _http_client directly — it always runs on the gateway's loop.
+        #
+        # If this adapter instance was disconnected while a reconnect watcher
+        # created a fresh Photon adapter/sidecar, _http_client may be None even
+        # though the loopback sidecar is healthy again. Still try the call: the
+        # sidecar token is stable across reconnects, so an in-flight final reply
+        # can deliver through the new sidecar instead of failing with "adapter
+        # not connected".
+        if self._http_client is None:
+            logger.debug(
+                "[photon] sidecar call %s with disconnected adapter; trying loopback",
+                path,
+            )
         url = f"http://{self._sidecar_bind}:{self._sidecar_port}{path}"
         headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
         async with httpx.AsyncClient(timeout=30.0) as client:
