@@ -50,6 +50,7 @@ def _make_runner() -> GatewayRunner:
     runner._exit_cleanly = False
     runner._failed_platforms = {}
     runner.adapters = {}
+    runner.session_store = MagicMock()
     return runner
 
 
@@ -208,6 +209,25 @@ class TestReconnectFDLeakRegression:
             f"got {adapter._disconnect_calls} calls. This is the hot path "
             "for the fd leak in #37011."
         )
+
+    @pytest.mark.asyncio
+    async def test_retryable_failure_honors_adapter_retry_after(self):
+        """Adapter-specific 429 cooldowns must override generic 30s backoff."""
+        runner = _make_runner()
+        _seed_runner_with_one_failure(runner)
+        adapter = _CountingAdapter(
+            succeed=False, fatal_error="Photon 429", fatal_retryable=True,
+        )
+        setattr(adapter, "retry_after_seconds", 900)
+        before = time.monotonic()
+
+        with patch.object(runner, "_create_adapter", return_value=adapter), \
+             patch.object(runner, "_connect_adapter_with_timeout",
+                          new=AsyncMock(return_value=False)):
+            await _run_watcher_one_iteration(runner)
+
+        next_retry = runner._failed_platforms[Platform.TELEGRAM]["next_retry"]
+        assert next_retry - before >= 899
 
     @pytest.mark.asyncio
     async def test_exception_during_connect_disposes_unowned_adapter(self):
