@@ -2536,6 +2536,24 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
+def _adapter_retry_after_seconds(adapter: "BasePlatformAdapter | None") -> float:
+    if adapter is None:
+        return 0.0
+    try:
+        raw = getattr(adapter, "retry_after_seconds", None)
+    except Exception:
+        return 0.0
+    if raw is None:
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return value
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -6407,10 +6425,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         # Queue for reconnection if the error is retryable
                         if adapter.fatal_error_retryable:
+                            retry_after = _adapter_retry_after_seconds(adapter)
                             self._failed_platforms[platform] = {
                                 "config": platform_config,
                                 "attempts": 1,
-                                "next_retry": time.monotonic() + 30,
+                                "next_retry": time.monotonic() + max(30.0, retry_after),
                             }
                     else:
                         self._update_platform_runtime_status(
@@ -7234,10 +7253,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             error_message=adapter.fatal_error_message or "failed to reconnect",
                         )
                         backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
+                        retry_after = _adapter_retry_after_seconds(adapter)
+                        backoff = max(float(backoff), retry_after)
                         info["attempts"] = attempt
                         info["next_retry"] = time.monotonic() + backoff
                         logger.info(
-                            "Reconnect %s failed, next retry in %ds",
+                            "Reconnect %s failed, next retry in %.0fs",
                             platform.value, backoff,
                         )
                         # Same fd-leak concern as the non-retryable branch
@@ -7272,10 +7293,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_message=str(e),
                     )
                     backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
+                    retry_after = _adapter_retry_after_seconds(adapter)
+                    backoff = max(float(backoff), retry_after)
                     info["attempts"] = attempt
                     info["next_retry"] = time.monotonic() + backoff
                     logger.warning(
-                        "Reconnect %s error: %s, next retry in %ds",
+                        "Reconnect %s error: %s, next retry in %.0fs",
                         platform.value, e, backoff,
                     )
                     # A raised exception during reconnect (connect timeout, DNS
