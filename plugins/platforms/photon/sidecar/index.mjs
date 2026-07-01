@@ -85,9 +85,18 @@ const STREAM_DEGRADED_RESTART_MS =
   Number(process.env.PHOTON_STREAM_DEGRADED_RESTART_MS) || 90 * 1000;
 const STREAM_INTERRUPTED_DEGRADE_COUNT =
   Number(process.env.PHOTON_STREAM_INTERRUPTED_DEGRADE_COUNT) || 3;
+const MISSED_DM_POLL_MS =
+  Number(process.env.PHOTON_MISSED_DM_POLL_MS) || 15 * 1000;
+const MISSED_DM_POLL_PAGE_SIZE = Math.max(
+  1,
+  Math.min(Number(process.env.PHOTON_MISSED_DM_POLL_PAGE_SIZE) || 20, 100)
+);
+const MISSED_DM_POLL_TIMEOUT_MS =
+  Number(process.env.PHOTON_MISSED_DM_POLL_TIMEOUT_MS) || 10 * 1000;
 
 const streamHealth = {
   state: "starting",
+  startedAt: Date.now(),
   degradedSince: null,
   lastHealthyAt: null,
   lastIssueAt: null,
@@ -95,20 +104,72 @@ const streamHealth = {
   issueCount: 0,
 };
 let streamRestartTimer = null;
+let streamStartingTimer = null;
+
+function isLoopbackAddress(address) {
+  return (
+    address === "127.0.0.1" ||
+    address === "::1" ||
+    address === "::ffff:127.0.0.1" ||
+    address === bind
+  );
+}
+
+function activeRemoteSocketCount() {
+  try {
+    const handles =
+      typeof process._getActiveHandles === "function"
+        ? process._getActiveHandles()
+        : [];
+    return handles.filter((handle) => {
+      const remoteAddress = handle?.remoteAddress;
+      const remotePort = handle?.remotePort;
+      return (
+        typeof remoteAddress === "string" &&
+        remotePort &&
+        !isLoopbackAddress(remoteAddress)
+      );
+    }).length;
+  } catch {
+    return null;
+  }
+}
 
 function streamHealthSnapshot() {
   const now = Date.now();
-  const degradedForMs =
-    streamHealth.degradedSince === null ? 0 : now - streamHealth.degradedSince;
+  const startingForMs =
+    streamHealth.state === "starting" ? now - streamHealth.startedAt : 0;
+  const remoteSocketCount = activeRemoteSocketCount();
+  const startingStalled =
+    streamHealth.state === "starting" &&
+    remoteSocketCount === 0 &&
+    STREAM_DEGRADED_RESTART_MS > 0 &&
+    startingForMs >= STREAM_DEGRADED_RESTART_MS;
+  const degradedForMs = startingStalled
+    ? startingForMs
+    : streamHealth.degradedSince === null
+      ? 0
+      : now - streamHealth.degradedSince;
+  let missedDm = null;
+  try {
+    missedDm = missedDmPollStatus();
+  } catch {
+    missedDm = null;
+  }
   return {
-    ok: streamHealth.state !== "degraded",
-    state: streamHealth.state,
+    ok: streamHealth.state !== "degraded" && !startingStalled,
+    state: startingStalled ? "starting_stalled" : streamHealth.state,
+    startingForMs,
+    remoteSocketCount,
     degradedForMs,
     restartAfterMs: STREAM_DEGRADED_RESTART_MS,
     lastHealthyAt: streamHealth.lastHealthyAt,
     lastIssueAt: streamHealth.lastIssueAt,
-    lastIssue: streamHealth.lastIssue,
+    lastIssue: startingStalled
+      ? "Photon upstream stream never opened a remote connection after sidecar startup"
+      : streamHealth.lastIssue,
     issueCount: streamHealth.issueCount,
+    missedDmPoll: missedDm,
   };
 }
 
@@ -120,6 +181,10 @@ function markStreamHealthy() {
   if (streamRestartTimer) {
     clearTimeout(streamRestartTimer);
     streamRestartTimer = null;
+  }
+  if (streamStartingTimer) {
+    clearTimeout(streamStartingTimer);
+    streamStartingTimer = null;
   }
 }
 
@@ -142,6 +207,21 @@ function scheduleStreamRestart() {
     process.exit(75);
   }, STREAM_DEGRADED_RESTART_MS + 1000);
   streamRestartTimer.unref();
+}
+
+function scheduleStartingStallRestart() {
+  if (STREAM_DEGRADED_RESTART_MS <= 0 || streamStartingTimer) return;
+  streamStartingTimer = setTimeout(() => {
+    streamStartingTimer = null;
+    const snapshot = streamHealthSnapshot();
+    if (snapshot.state !== "starting_stalled") return;
+    console.error(
+      `photon-sidecar: upstream stream still starting after ${snapshot.startingForMs}ms ` +
+        `with ${snapshot.remoteSocketCount} remote sockets; exiting so Hermes can restart the Photon adapter`
+    );
+    process.exit(75);
+  }, STREAM_DEGRADED_RESTART_MS + 1000);
+  streamStartingTimer.unref();
 }
 
 function markStreamDegraded(reason) {
@@ -169,23 +249,40 @@ function markStreamRecovering(reason) {
   }
 }
 
+let lastClassifiedStreamReason = null;
+let lastClassifiedStreamReasonAt = 0;
+
 function classifyStreamLog(text) {
   if (!text.includes("[spectrum.stream]")) return;
   const reason = text.split("\n", 1)[0];
-  if (text.includes("persistently failing")) {
+
+  // Some Spectrum loggers flow through console.* while others write directly
+  // to process stdout/stderr. When console.* ultimately writes to the process
+  // stream we can see the same first line twice; dedupe only that tight echo,
+  // not real repeated stream failures minutes apart.
+  const now = Date.now();
+  if (
+    reason === lastClassifiedStreamReason &&
+    now - lastClassifiedStreamReasonAt < 250
+  ) {
+    return;
+  }
+  lastClassifiedStreamReason = reason;
+  lastClassifiedStreamReasonAt = now;
+
+  if (text.includes("stream recovered") || text.includes("stream recover hook ran")) {
+    markStreamHealthy();
+  } else if (text.includes("persistently failing")) {
     markStreamDegraded(reason);
   } else if (text.includes("stream interrupted")) {
     markStreamRecovering(reason);
   }
 }
 
-// spectrum-ts routes its stream telemetry through @photon-ai/otel's
-// createLogger, which sends severity >= ERROR to console.error and
-// everything else (WARN/INFO) to console.log. The two lines we key off
-// land on *different* channels: `log.error("stream persistently failing")`
-// -> console.error, but `log.warn("stream interrupted; reconnecting")`
-// -> console.log. Patch both so the recovering/degraded counters see the
-// interrupt bursts, not just the terminal "persistently failing" line.
+// spectrum-ts routes stream telemetry through more than one path across
+// versions: some releases use console.log/error, while others write directly
+// to process stdout/stderr. Patch both layers so WARN-only interrupt bursts
+// are visible to healthz instead of becoming silent inbound iMessage outages.
 const originalConsoleError = console.error.bind(console);
 console.error = (...args) => {
   const text = args
@@ -203,6 +300,23 @@ console.log = (...args) => {
   classifyStreamLog(text);
   originalConsoleLog(...args);
 };
+
+function wrapProcessStreamWrite(stream) {
+  const originalWrite = stream.write.bind(stream);
+  stream.write = (chunk, ...args) => {
+    try {
+      const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+      classifyStreamLog(text);
+    } catch {
+      // Logging interception must never break normal output.
+    }
+    return originalWrite(chunk, ...args);
+  };
+}
+
+wrapProcessStreamWrite(process.stdout);
+wrapProcessStreamWrite(process.stderr);
+scheduleStartingStallRestart();
 
 if (!projectId || !projectSecret || !sharedToken) {
   console.error(
@@ -239,7 +353,9 @@ let Spectrum,
   voice,
   spectrumText,
   spectrumMarkdown,
-  spectrumTyping;
+  spectrumTyping,
+  cloud,
+  createClient;
 try {
   ({
     Spectrum,
@@ -250,6 +366,8 @@ try {
     typing: spectrumTyping,
   } = await import("spectrum-ts"));
   ({ imessage } = await import("spectrum-ts/providers/imessage"));
+  ({ cloud } = await import("@spectrum-ts/core"));
+  ({ createClient } = await import("@photon-ai/advanced-imessage"));
 } catch (e) {
   console.error(
     "photon-sidecar: spectrum-ts is not installed. Run `npm install` " +
@@ -499,6 +617,270 @@ async function normalizeEvent(space, message) {
   }
 }
 
+function configuredMissedDmPhones() {
+  const candidates = [];
+  for (const raw of [
+    process.env.PHOTON_HOME_CHANNEL || "",
+    process.env.PHOTON_ALLOWED_USERS || "",
+  ]) {
+    for (const match of String(raw).matchAll(/\+\d{6,}/g)) {
+      candidates.push(match[0]);
+    }
+  }
+  return Array.from(new Set(candidates));
+}
+
+function rawRecentContent(raw) {
+  const content = raw?.content || {};
+  const text = typeof content.text === "string" ? content.text : "";
+  const attachments = Array.isArray(content.attachments)
+    ? content.attachments
+    : [];
+  const items = [];
+  if (text) items.push({ content: { type: "text", text } });
+  for (const att of attachments) {
+    items.push({
+      content: {
+        type: raw?.isAudioMessage ? "voice" : "attachment",
+        id: att?.guid ?? att?.id ?? null,
+        name: att?.filename ?? att?.name ?? null,
+        mimeType: att?.mimeType ?? att?.uti ?? null,
+        size: typeof att?.totalBytes === "number" ? att.totalBytes : null,
+      },
+    });
+  }
+  if (items.length > 1) return { type: "group", items };
+  if (items.length === 1) return items[0].content;
+  return { type: "unknown" };
+}
+
+function eventFromRawRecentMessage(phone, raw) {
+  const messageId = raw?.guid;
+  if (!messageId || typeof messageId !== "string") return null;
+  const chatGuid =
+    Array.isArray(raw?.chatGuids) && raw.chatGuids.length
+      ? raw.chatGuids[0]
+      : `any;-;${phone}`;
+  const ts = raw?.dateCreated;
+  return {
+    messageId,
+    platform: "iMessage",
+    space: { id: chatGuid, type: "dm", phone },
+    sender: { id: raw?.sender?.address || phone },
+    content: rawRecentContent(raw),
+    timestamp:
+      ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
+  };
+}
+
+const missedDmSeen = new Set();
+let missedDmTokenData = null;
+let missedDmTokenExpiresAt = 0;
+let missedDmClient = null;
+let missedDmPollPrimed = false;
+let missedDmPollInFlight = false;
+let missedDmPollTimer = null;
+let missedDmLastPollAt = null;
+let missedDmLastSuccessAt = null;
+let missedDmLastErrorAt = null;
+let missedDmLastError = null;
+let missedDmLastDeliveredAt = null;
+let missedDmLastDeliveredCount = 0;
+
+function missedDmPollStatus() {
+  const phones = configuredMissedDmPhones();
+  return {
+    enabled: MISSED_DM_POLL_MS > 0 && phones.length > 0,
+    intervalMs: MISSED_DM_POLL_MS,
+    timeoutMs: MISSED_DM_POLL_TIMEOUT_MS,
+    pageSize: MISSED_DM_POLL_PAGE_SIZE,
+    configuredDmCount: phones.length,
+    primed: missedDmPollPrimed,
+    inFlight: missedDmPollInFlight,
+    seenCount: missedDmSeen.size,
+    lastPollAt: missedDmLastPollAt,
+    lastSuccessAt: missedDmLastSuccessAt,
+    lastErrorAt: missedDmLastErrorAt,
+    lastError: missedDmLastError,
+    lastDeliveredAt: missedDmLastDeliveredAt,
+    lastDeliveredCount: missedDmLastDeliveredCount,
+  };
+}
+
+function withTimeout(label, ms, fn) {
+  let timer = null;
+  return Promise.race([
+    Promise.resolve().then(fn),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`${label} timed out after ${ms}ms`));
+      }, ms);
+      timer.unref?.();
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function resetMissedDmClient() {
+  if (missedDmClient) {
+    try {
+      await missedDmClient.close();
+    } catch {
+      /* ignore */
+    }
+    missedDmClient = null;
+  }
+}
+
+function rememberMissedDmSeen(id) {
+  if (!id || typeof id !== "string") return;
+  if (missedDmSeen.has(id)) missedDmSeen.delete(id);
+  missedDmSeen.add(id);
+  while (missedDmSeen.size > MAX_KNOWN_MESSAGES * 4) {
+    const oldest = missedDmSeen.keys().next().value;
+    if (oldest === undefined) break;
+    missedDmSeen.delete(oldest);
+  }
+}
+
+async function missedDmToken() {
+  if (
+    !missedDmTokenData ||
+    Date.now() > missedDmTokenExpiresAt - 30 * 1000
+  ) {
+    missedDmTokenData = await cloud.issueImessageTokens(projectId, projectSecret);
+    missedDmTokenExpiresAt =
+      Date.now() + Number(missedDmTokenData.expiresIn || 0) * 1000;
+  }
+  return missedDmTokenData.token;
+}
+
+function getMissedDmClient() {
+  if (!missedDmClient) {
+    missedDmClient = createClient({
+      address:
+        process.env.SPECTRUM_IMESSAGE_ADDRESS ||
+        "imessage.spectrum.photon.codes:443",
+      autoIdempotency: true,
+      retry: true,
+      tls: true,
+      token: missedDmToken,
+    });
+  }
+  return missedDmClient;
+}
+
+async function pollMissedDmMessages() {
+  if (missedDmPollInFlight) return;
+  const phones = configuredMissedDmPhones();
+  if (phones.length === 0 || MISSED_DM_POLL_MS <= 0) return;
+  // If the primary stream never opened any upstream socket, let the startup
+  // stall detector restart the sidecar instead of masking it with the fallback
+  // poller's own gRPC connection.
+  if (streamHealth.state === "starting" && activeRemoteSocketCount() === 0) {
+    return;
+  }
+  missedDmPollInFlight = true;
+  missedDmLastPollAt = new Date().toISOString();
+  try {
+    const client = getMissedDmClient();
+    const pending = [];
+    let pollHadSuccess = false;
+    for (const phone of phones) {
+      let result;
+      try {
+        result = await withTimeout(
+          "missed-DM listInChat",
+          MISSED_DM_POLL_TIMEOUT_MS,
+          () =>
+            client.messages.listInChat(`any;-;${phone}`, {
+              pageSize: MISSED_DM_POLL_PAGE_SIZE,
+            })
+        );
+        missedDmLastSuccessAt = new Date().toISOString();
+        missedDmLastError = null;
+        pollHadSuccess = true;
+      } catch (e) {
+        missedDmLastErrorAt = new Date().toISOString();
+        missedDmLastError = e && e.message ? e.message : String(e);
+        console.error(
+          "photon-sidecar: missed-DM poll failed for configured DM: " +
+            missedDmLastError
+        );
+        if (missedDmLastError.includes("timed out")) {
+          await resetMissedDmClient();
+        }
+        continue;
+      }
+      for (const raw of Array.isArray(result?.messages) ? result.messages : []) {
+        const id = raw?.guid;
+        if (!id || missedDmSeen.has(id)) continue;
+        rememberMissedDmSeen(id);
+        if (raw?.isFromMe) continue;
+        const event = eventFromRawRecentMessage(phone, raw);
+        if (event) pending.push(event);
+      }
+    }
+    if (!pollHadSuccess) {
+      return;
+    }
+    if (!missedDmPollPrimed) {
+      // Avoid replaying old retained history on startup. Subsequent polls only
+      // forward newly observed inbound rows missed by the live stream. A failed
+      // or timed-out poll is not a valid prime; otherwise the first later
+      // success can replay retained history.
+      missedDmPollPrimed = true;
+      return;
+    }
+    for (const event of pending.reverse()) {
+      await deliver(JSON.stringify(event));
+    }
+    missedDmLastDeliveredCount = pending.length;
+    if (pending.length > 0) {
+      missedDmLastDeliveredAt = new Date().toISOString();
+      markStreamHealthy();
+      console.error(
+        `photon-sidecar: delivered ${pending.length} missed inbound DM message(s) via retained-history poll`
+      );
+    }
+  } finally {
+    missedDmPollInFlight = false;
+  }
+}
+
+function startMissedDmPoller() {
+  if (MISSED_DM_POLL_MS <= 0 || missedDmPollTimer) return;
+  const phones = configuredMissedDmPhones();
+  if (phones.length === 0) return;
+  missedDmPollTimer = setInterval(() => {
+    pollMissedDmMessages().catch((e) => {
+      console.error(
+        "photon-sidecar: missed-DM poller error: " +
+          (e && e.stack ? e.stack : String(e))
+      );
+    });
+  }, MISSED_DM_POLL_MS);
+  missedDmPollTimer.unref();
+  // Prime after startup without blocking the live stream setup.
+  setTimeout(() => {
+    pollMissedDmMessages().catch((e) => {
+      console.error(
+        "photon-sidecar: missed-DM poller prime failed: " +
+          (e && e.message ? e.message : String(e))
+      );
+    });
+  }, Math.min(5000, MISSED_DM_POLL_MS)).unref();
+}
+
+async function stopMissedDmPoller() {
+  if (missedDmPollTimer) {
+    clearInterval(missedDmPollTimer);
+    missedDmPollTimer = null;
+  }
+  await resetMissedDmClient();
+}
+
 function inboundStreamErrorMessage(e) {
   const msg = e && e.message ? e.message : String(e);
   let out = "photon-sidecar: inbound stream errored — restarting: " + msg;
@@ -558,6 +940,7 @@ function inboundStreamErrorMessage(e) {
     backoff = Math.min(backoff * 2, 30000);
   }
 })();
+startMissedDmPoller();
 
 // ---------------------------------------------------------------------------
 // HTTP control + inbound server (loopback only).
@@ -868,7 +1251,7 @@ async function shutdown(signal) {
   console.error(`photon-sidecar: received ${signal}, stopping...`);
   try {
     await Promise.race([
-      app.stop(),
+      Promise.all([app.stop(), stopMissedDmPoller()]),
       new Promise((resolve) => setTimeout(resolve, 3000)),
     ]);
   } catch (e) {
