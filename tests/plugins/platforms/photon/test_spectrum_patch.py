@@ -26,21 +26,59 @@ def test_sidecar_healthz_reports_stream_health() -> None:
     assert "process.exit(75);" in index
 
 
-def test_sidecar_intercepts_both_console_channels() -> None:
-    """spectrum-ts routes its stream telemetry through @photon-ai/otel, which
-    sends severity >= ERROR to console.error and WARN/INFO to console.log.
-    The two lines the health monitor keys off land on *different* channels:
-    `log.error("stream persistently failing")` -> console.error, but
-    `log.warn("stream interrupted; reconnecting")` -> console.log. Patching
-    only console.error would miss every interrupt burst (the primary silent-
-    inbound symptom), so both channels must be intercepted.
+def test_sidecar_starting_without_remote_socket_becomes_unhealthy() -> None:
+    """A sidecar can be locally alive while the upstream gRPC stream never
+    opens. healthz must not report that as OK forever, or inbound iMessages
+    silently disappear until a manual restart.
+    """
+    index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
+    assert "activeRemoteSocketCount()" in index
+    assert "remoteSocketCount === 0" in index
+    assert 'state: startingStalled ? "starting_stalled" : streamHealth.state' in index
+    assert "Photon upstream stream never opened a remote connection" in index
+    assert "scheduleStartingStallRestart();" in index
+
+
+def test_sidecar_polls_retained_dm_history_for_missed_live_events() -> None:
+    """Photon's live shared-iMessage stream can miss events while retained
+    DM history still has them. The sidecar must poll the configured home /
+    allowlisted DMs as a fallback and feed the same NDJSON delivery path.
+    """
+    index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
+    package = Path("plugins/platforms/photon/sidecar/package.json").read_text(encoding="utf-8")
+    assert "function configuredMissedDmPhones()" in index
+    assert "client.messages.listInChat" in index
+    assert "MISSED_DM_POLL_TIMEOUT_MS" in index
+    assert "withTimeout(" in index
+    assert "missedDmPollStatus()" in index
+    assert "resetMissedDmClient()" in index
+    assert "let pollHadSuccess = false" in index
+    assert "if (!pollHadSuccess)" in index
+    assert "A failed" in index
+    assert "eventFromRawRecentMessage" in index
+    assert "delivered ${pending.length} missed inbound DM message(s)" in index
+    assert "startMissedDmPoller();" in index
+    assert '"@photon-ai/advanced-imessage": "0.12.0"' in package
+    assert '"@spectrum-ts/core": "8.0.0"' in package
+
+
+def test_sidecar_intercepts_console_and_process_write_channels() -> None:
+    """Spectrum stream telemetry has used both console.* and direct
+    stdout/stderr writes across SDK/logger versions. WARN-only interrupt bursts
+    are the silent-inbound failure mode, so both layers must feed the same
+    health classifier and tight duplicate echoes must be ignored.
     """
     index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
     assert "function classifyStreamLog(" in index
     assert "console.error = (...args) =>" in index
     assert "console.log = (...args) =>" in index
-    # Both wrappers must feed the shared classifier.
-    assert index.count("classifyStreamLog(text)") >= 2
+    assert "function wrapProcessStreamWrite(stream)" in index
+    assert "wrapProcessStreamWrite(process.stdout);" in index
+    assert "wrapProcessStreamWrite(process.stderr);" in index
+    assert "lastClassifiedStreamReason" in index
+    assert "stream recovered" in index
+    # All wrappers must feed the shared classifier.
+    assert index.count("classifyStreamLog(text)") >= 3
 
 
 def test_sidecar_labels_catchup_internal_errors_as_upstream_photon() -> None:
