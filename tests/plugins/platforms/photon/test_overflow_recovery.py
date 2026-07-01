@@ -259,6 +259,45 @@ async def test_degraded_stream_health_raises_retryable_fatal(
 
 
 @pytest.mark.asyncio
+async def test_starting_stalled_stream_health_raises_retryable_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    adapter._inbound_running = True
+    adapter._sidecar_health_interval = 0.0
+
+    async def _fake_call(path: str, payload: Dict[str, Any]) -> Any:
+        assert path == "/healthz"
+        return {
+            "ok": True,
+            "stream": {
+                "ok": False,
+                "state": "starting_stalled",
+                "startingForMs": 120000,
+                "remoteSocketCount": 0,
+                "degradedForMs": 120000,
+                "lastIssue": "Photon upstream stream never opened a remote connection after sidecar startup",
+            },
+        }
+
+    notified: list[bool] = []
+
+    async def _fake_notify() -> None:
+        notified.append(True)
+        adapter._inbound_running = False
+
+    monkeypatch.setattr(adapter, "_sidecar_call", _fake_call)
+    monkeypatch.setattr(adapter, "_notify_fatal_error", _fake_notify)
+
+    await adapter._monitor_sidecar_health()
+
+    assert adapter.has_fatal_error is True
+    assert adapter.fatal_error_code == "UPSTREAM_STREAM_DEGRADED"
+    assert adapter.fatal_error_retryable is True
+    assert notified == [True]
+
+
+@pytest.mark.asyncio
 async def test_short_stream_degradation_waits_for_sidecar_recovery_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
