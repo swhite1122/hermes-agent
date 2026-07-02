@@ -1170,8 +1170,57 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
+def _sanitize_display_payload_value(value: Any) -> Any:
+    """Recursively sanitize display-event payload strings.
+
+    The TUI/Desktop transport is an egress surface: anything in an event payload
+    may be rendered immediately by Electron/Ink. Keep memory-context fences out
+    even when a callback bypasses the normal message streaming path.
+    """
+    if isinstance(value, str):
+        return _display_text(value)
+    if isinstance(value, list):
+        return [_sanitize_display_payload_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_display_payload_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _display_event_stream_scrubber(sid: str, event: str) -> Any:
+    session = _sessions.get(sid)
+    if not isinstance(session, dict):
+        return _new_display_scrubber()
+    scrubbers = session.setdefault("display_event_scrubbers", {})
+    if not isinstance(scrubbers, dict):
+        scrubbers = {}
+        session["display_event_scrubbers"] = scrubbers
+    scrubber = scrubbers.get(event)
+    if scrubber is None:
+        scrubber = _new_display_scrubber()
+        scrubbers[event] = scrubber
+    return scrubber
+
+
+def _sanitize_display_event_payload(event: str, sid: str, payload: dict | None) -> dict | None:
+    if payload is None:
+        return None
+    clean = _sanitize_display_payload_value(dict(payload))
+    if event.endswith(".delta") and isinstance(clean, dict) and "text" in payload:
+        clean["text"] = _stream_display_text(
+            _display_event_stream_scrubber(sid, event),
+            payload.get("text"),
+        )
+    return clean
+
+
 def _emit(event: str, sid: str, payload: dict | None = None):
-    params = {"type": event, "session_id": sid}
+    payload = _sanitize_display_event_payload(event, sid, payload)
+    if event.endswith(".delta") and isinstance(payload, dict) and payload.get("text") == "":
+        return
+    params: dict[str, Any] = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
