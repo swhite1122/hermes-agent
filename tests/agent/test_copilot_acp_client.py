@@ -10,7 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import CopilotACPClient, _build_session_new_params
+from providers import get_provider_profile
 
 
 class _FakeProcess:
@@ -105,7 +106,13 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
     def test_timeout_object_is_coerced_for_streaming_requests(self) -> None:
         captured: dict[str, float] = {}
 
-        def fake_run_prompt(prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+        def fake_run_prompt(
+            prompt_text: str,
+            *,
+            model: str | None = None,
+            effort: str | None = None,
+            timeout_seconds: float,
+        ) -> tuple[str, str]:
             captured["timeout"] = timeout_seconds
             return "ok", ""
 
@@ -126,6 +133,118 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             )
 
         self.assertEqual(captured["timeout"], 12.0)
+
+    def test_create_chat_completion_forwards_model_to_acp_session(self) -> None:
+        captured: dict[str, str | None] = {}
+
+        def fake_run_prompt(
+            prompt_text: str,
+            *,
+            model: str | None = None,
+            effort: str | None = None,
+            timeout_seconds: float,
+        ) -> tuple[str, str]:
+            captured["model"] = model
+            return "ok", ""
+
+        with patch.object(self.client, "_run_prompt", side_effect=fake_run_prompt):
+            self.client._create_chat_completion(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        self.assertEqual(captured["model"], "claude-opus-4-8")
+
+    def test_create_chat_completion_forwards_reasoning_effort_to_acp_session(self) -> None:
+        captured: dict[str, str | None] = {}
+
+        def fake_run_prompt(
+            prompt_text: str,
+            *,
+            model: str | None = None,
+            effort: str | None = None,
+            timeout_seconds: float,
+        ) -> tuple[str, str]:
+            captured["effort"] = effort
+            return "ok", ""
+
+        with patch.object(self.client, "_run_prompt", side_effect=fake_run_prompt):
+            self.client._create_chat_completion(
+                model="claude-sonnet-5",
+                reasoning_effort="high",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        self.assertEqual(captured["effort"], "high")
+
+    def test_session_new_params_forward_real_claude_model(self) -> None:
+        params = _build_session_new_params(cwd="/tmp/project", model="claude-opus-4-8")
+
+        self.assertEqual(params["cwd"], "/tmp/project")
+        self.assertEqual(params["mcpServers"], [])
+        self.assertEqual(
+            params["_meta"],
+            {"claudeCode": {"options": {"model": "claude-opus-4-8"}}},
+        )
+
+    def test_session_new_params_forward_claude_effort(self) -> None:
+        params = _build_session_new_params(
+            cwd="/tmp/project",
+            model="claude-sonnet-5",
+            effort="high",
+        )
+
+        self.assertEqual(
+            params["_meta"],
+            {
+                "claudeCode": {
+                    "options": {
+                        "model": "claude-sonnet-5",
+                        "effort": "high",
+                    }
+                }
+            },
+        )
+
+    def test_session_new_params_normalize_minimal_effort_to_low(self) -> None:
+        params = _build_session_new_params(cwd="/tmp/project", effort="minimal")
+
+        self.assertEqual(params["_meta"], {"claudeCode": {"options": {"effort": "low"}}})
+
+    def test_session_new_params_skip_transport_placeholder_model(self) -> None:
+        params = _build_session_new_params(cwd="/tmp/project", model="copilot-acp")
+
+        self.assertNotIn("_meta", params)
+
+    def test_copilot_acp_profile_maps_reasoning_to_top_level_effort(self) -> None:
+        profile = get_provider_profile("copilot-acp")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+
+        extra_body, top_level = profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"}
+        )
+
+        self.assertEqual(extra_body, {})
+        self.assertEqual(top_level, {"reasoning_effort": "high"})
+
+    def test_copilot_acp_profile_normalizes_minimal_and_skips_disabled(self) -> None:
+        profile = get_provider_profile("copilot-acp")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+
+        self.assertEqual(
+            profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": True, "effort": "minimal"}
+            ),
+            ({}, {"reasoning_effort": "low"}),
+        )
+        self.assertEqual(
+            profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": False, "effort": "high"}
+            ),
+            ({}, {}),
+        )
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()
@@ -287,6 +406,7 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
 
     monkeypatch.setenv("HOME", str(real_home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
 
     captured = {}
     client = _make_home_client(tmp_path)

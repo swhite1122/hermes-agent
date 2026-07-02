@@ -74,6 +74,53 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw)
 
 
+def _normalize_claude_sdk_effort(effort: Any) -> str | None:
+    """Return a Claude Agent SDK effort value from Hermes/OpenAI-ish input."""
+
+    value = str(effort or "").strip().lower()
+    if not value or value == "none":
+        return None
+    if value == "minimal":
+        return "low"
+    if value in {"low", "medium", "high", "xhigh", "max"}:
+        return value
+    return None
+
+
+def _build_session_new_params(
+    *,
+    cwd: str,
+    model: str | None = None,
+    effort: Any = None,
+) -> dict[str, Any]:
+    """Build ACP session/new params for Claude Agent SDK options.
+
+    The copilot-acp provider is also used as a generic ACP transport. When it is
+    pointed at claude-agent-acp, Hermes' requested model and reasoning effort
+    must be sent as Claude Agent SDK options; putting them only in the prompt is
+    just a hint.
+    """
+
+    params: dict[str, Any] = {
+        "cwd": cwd,
+        "mcpServers": [],
+    }
+    options: dict[str, Any] = {}
+    model_name = str(model or "").strip()
+    if model_name and model_name != "copilot-acp":
+        options["model"] = model_name
+    effort_name = _normalize_claude_sdk_effort(effort)
+    if effort_name:
+        options["effort"] = effort_name
+    if options:
+        params["_meta"] = {
+            "claudeCode": {
+                "options": options,
+            },
+        }
+    return params
+
+
 def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
     home = os.environ.get("HOME", "").strip()
@@ -445,6 +492,7 @@ class CopilotACPClient:
         timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
+        reasoning_effort: Any = None,
         stream: bool = False,
         **_: Any,
     ) -> Any:
@@ -472,6 +520,8 @@ class CopilotACPClient:
 
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
+            model=model,
+            effort=reasoning_effort,
             timeout_seconds=_effective_timeout,
         )
 
@@ -501,7 +551,14 @@ class CopilotACPClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        model: str | None = None,
+        effort: Any = None,
+        timeout_seconds: float,
+    ) -> tuple[str, str]:
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -632,10 +689,11 @@ class CopilotACPClient:
             )
             session = _request(
                 "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                },
+                _build_session_new_params(
+                    cwd=self._acp_cwd,
+                    model=model,
+                    effort=effort,
+                ),
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
