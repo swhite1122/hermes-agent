@@ -1106,6 +1106,40 @@ def test_prompt_submit_sanitizes_streamed_memory_context_for_display(monkeypatch
         server._sessions.pop("sid", None)
 
 
+def test_emit_sanitizes_display_event_payloads(monkeypatch):
+    """All TUI/Desktop event egress should scrub recalled-memory fences.
+
+    Message streaming has its own scrubber, but callbacks such as reasoning,
+    thinking, status, and nested tool previews also render in Desktop. Keep the
+    central event seam defensive so provider/path drift cannot expose memory.
+    """
+    emitted: list[dict] = []
+    server._sessions["sid"] = {}
+    try:
+        monkeypatch.setattr(server, "write_json", lambda obj: emitted.append(obj) or True)
+        server._emit("reasoning.delta", "sid", {"text": "visible before\n\n<memory-context>\nsecret"})
+        server._emit("reasoning.delta", "sid", {"text": " still secret\n</memory-context>\n after"})
+        server._emit(
+            "tool.start",
+            "sid",
+            {
+                "name": "demo",
+                "preview": "ok <memory-context>nested secret</memory-context> done",
+            },
+        )
+
+        payloads = [obj["params"].get("payload", {}) for obj in emitted]
+        rendered = json.dumps(payloads)
+        assert "visible before" in rendered
+        assert " after" in rendered
+        assert "ok " in rendered
+        assert " done" in rendered
+        assert "memory-context" not in rendered.lower()
+        assert "secret" not in rendered
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     captured = {}
 
