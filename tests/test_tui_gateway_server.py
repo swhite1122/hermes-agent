@@ -6825,7 +6825,8 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=types.SimpleNamespace(launched=False, hint=None),
             ),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
@@ -6881,7 +6882,8 @@ def test_browser_manage_connect_no_session_skips_progress_events(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=types.SimpleNamespace(launched=False, hint=None),
             ),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
@@ -6969,7 +6971,8 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
+            "hermes_cli.browser_connect.launch_chrome_debug",
+            return_value=types.SimpleNamespace(launched=True, hint=None),
         ):
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
