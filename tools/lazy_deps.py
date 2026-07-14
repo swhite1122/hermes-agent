@@ -210,6 +210,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "google-api-python-client==2.194.0",
         "google-auth-oauthlib==1.3.1",
         "google-auth-httplib2==0.3.1",
+        "httplib2==0.32.0",  # PYSEC-2026-3444 — keep in sync with pyproject [google]
     ),
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
 
