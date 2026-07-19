@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 
+from hermes_cli.display_sanitizer import sanitize_display_value
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
@@ -600,7 +601,8 @@ async def get_session_messages(
             sid = db.resolve_resume_session_id(sid)
             # Clamp limit to prevent abuse (max 500 per page)
             _limit = min(limit, 500) if limit is not None else None
-            return sid, _limit, db.get_messages(sid, limit=_limit, offset=offset)
+            messages = db.get_messages(sid, limit=_limit, offset=offset)
+            return sid, _limit, sanitize_display_value(messages)
         finally:
             db.close()
 
