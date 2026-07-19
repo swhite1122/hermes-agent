@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
+from hermes_cli.display_sanitizer import sanitize_display_value
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
@@ -627,14 +628,15 @@ async def get_session_messages(
             # dashboard view returns the latest page in chronological order.
             default_page = limit is None
             latest_page = order == "latest" or (order is None and default_page)
-            _limit = 500 if default_page else min(limit, 500)
-            return sid, _limit, db.get_messages(
+            _limit = 500 if limit is None else min(limit, 500)
+            messages = db.get_messages(
                 sid,
                 limit=_limit,
                 offset=offset,
                 latest=latest_page,
                 include_compacted=include_compacted,
             )
+            return sid, _limit, sanitize_display_value(messages)
         finally:
             db.close()
 
