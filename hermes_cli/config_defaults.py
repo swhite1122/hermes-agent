@@ -1762,6 +1762,10 @@ DEFAULT_CONFIG = {
         # platforms are configured. Failure -> last_status=blocked_config, ONE alert, no LLM call.
         # False = fail during the run instead.
         "preflight": True,
+        # Whether this profile's gateway should run the cron scheduler loop.
+        # Profiles that should chat but never execute shared cron jobs can set
+        # this false while leaving the default/root profile as the sole runner.
+        "enabled": True,
         # Default model for cron jobs (WHAT model runs). Fire-time resolution: per-job pin >
         # cron.model > model.default (the main agent model). An unpinned job follows the main
         # model on every run; cron.model decouples the whole fleet from chat. "" = fall through.
