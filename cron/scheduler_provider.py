@@ -473,6 +473,28 @@ def fire_overdue_jobs(
     return fired
 
 
+class DisabledCronScheduler(CronScheduler):
+    """No-op scheduler used when cron.enabled is false for a profile."""
+
+    @property
+    def name(self) -> str:
+        return "disabled"
+
+    def start(self, stop_event, *, adapters=None, loop=None, interval=60):
+        return None
+
+    def fire_due(self, job_id: str, *, adapters=None, loop=None) -> bool:
+        return False
+
+
+def _cron_enabled(config: dict | None) -> bool:
+    cron_cfg = (config or {}).get("cron") or {}
+    value = cron_cfg.get("enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    return bool(value)
+
+
 def resolve_cron_scheduler() -> "CronScheduler":
     """Return the active cron scheduler provider.
 
@@ -488,7 +510,10 @@ def resolve_cron_scheduler() -> "CronScheduler":
     name = ""
     try:
         from hermes_cli.config import cfg_get, load_config
-        name = (cfg_get(load_config(), "cron", "provider", default="") or "").strip()
+        config = load_config()
+        if not _cron_enabled(config):
+            return DisabledCronScheduler()
+        name = (cfg_get(config, "cron", "provider", default="") or "").strip()
     except Exception:
         pass
 
