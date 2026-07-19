@@ -57,6 +57,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__, __release_date__
+from hermes_cli.display_sanitizer import sanitize_display_value
 from hermes_cli.config import (
     cfg_get,
     DEFAULT_CONFIG,
@@ -11615,7 +11616,8 @@ async def get_session_messages(
             sid = db.resolve_resume_session_id(sid)
             # Clamp limit to prevent abuse (max 500 per page)
             _limit = min(limit, 500) if limit is not None else None
-            return sid, _limit, db.get_messages(sid, limit=_limit, offset=offset)
+            messages = db.get_messages(sid, limit=_limit, offset=offset)
+            return sid, _limit, sanitize_display_value(messages)
         finally:
             db.close()
 
