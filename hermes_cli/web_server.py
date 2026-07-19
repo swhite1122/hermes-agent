@@ -11687,6 +11687,7 @@ async def _auto_archive_ticker_loop(
 
 
 
+
 def _prune_sessions(body: SessionPrune):
     """Delete ended sessions matching filters (mirrors `hermes sessions prune`)."""
     has_window = (
