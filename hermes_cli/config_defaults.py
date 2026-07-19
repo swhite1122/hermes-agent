@@ -1628,6 +1628,10 @@ DEFAULT_CONFIG = {
         # platforms are configured. Failure -> last_status=blocked_config, ONE alert, no LLM call.
         # False = fail during the run instead.
         "preflight": True,
+        # Whether this profile's gateway should run the cron scheduler loop.
+        # Profiles that should chat but never execute shared cron jobs can set
+        # this false while leaving the default/root profile as the sole runner.
+        "enabled": True,
         # Fail closed when an unpinned job's current global model/provider differs from its
         # creation-time snapshot, so unattended jobs never silently inherit a paid default. False
         # only when jobs should track changing global inference defaults.
