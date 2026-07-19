@@ -191,7 +191,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # display_kind="hidden": model-facing scaffolding the "[System:" sniff does not catch.
         if role not in _HISTORY_ROLES or m.get("display_kind") == "hidden":
             continue
-        content_text = _coerce_message_text(m.get("content"))
+        content_text = _display_text(_coerce_message_text(m.get("content")))
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
@@ -215,7 +215,12 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             messages.append({"role": "tool", "name": name, "context": _tool_ctx(name, args), **({"args": args} if args else {})})
             continue
         # Assistant detail sidecars can carry the only visible reply or reasoning after resume/reload.
-        has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)
+        reasoning = {
+            key: _sanitize_display_value(m.get(key))
+            for key in _HISTORY_ASSISTANT_DETAIL_KEYS
+            if role == "assistant" and key in m and m.get(key) is not None
+        }
+        has_assistant_detail = bool(reasoning)
         if not content_text.strip() and not has_assistant_detail:
             continue
         msg = {"role": role, "text": content_text}
@@ -231,8 +236,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         invocation = _skill_scaffold_projection(content_text) if role == "user" else ""
         if invocation:
             msg.update(text=invocation, display_kind="skill_invocation")
-        if role == "assistant":
-            msg.update((key, m[key]) for key in _HISTORY_ASSISTANT_DETAIL_KEYS if m.get(key) is not None)
+        msg.update(reasoning)
         # Display-only timeline metadata (model switches, delegation events).
         display_kind = m.get("display_kind") or _legacy_display_kind(role, content_text)
         if display_kind:
