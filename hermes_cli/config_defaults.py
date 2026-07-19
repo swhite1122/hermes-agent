@@ -2034,6 +2034,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Whether this profile's gateway should run the cron scheduler loop.
+        # Profiles that should chat but never execute shared cron jobs can set
+        # this false while leaving the default/root profile as the sole runner.
+        "enabled": True,
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
         # jobs from silently inheriting a paid default. Set to false only when
