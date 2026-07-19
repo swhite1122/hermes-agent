@@ -139,6 +139,11 @@ try:
 except Exception:
     pass
 
+from hermes_cli.display_sanitizer import (
+    MemoryContextScrubber as _MemoryContextScrubber,
+    sanitize_display_text as _display_text,
+    sanitize_display_value as _sanitize_display_value,
+)
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
@@ -216,6 +221,35 @@ _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS = 60
 _TURN_SETTLE_BEFORE_CLOSE_SECONDS = 5.0
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
+
+
+def _new_display_scrubber() -> Any:
+    """Create a stateful display scrubber for split streaming deltas."""
+    return _MemoryContextScrubber()
+
+
+def _stream_display_text(scrubber: Any, text: Any) -> str:
+    """Scrub one streaming chunk before it reaches TUI/Desktop renderers."""
+    if text is None:
+        return ""
+    raw = str(text)
+    if not raw:
+        return ""
+    try:
+        return scrubber.feed(raw)
+    except Exception:
+        return ""
+
+
+def _flush_stream_display_text(scrubber: Any) -> str:
+    """Flush held partial-tag text at the end of a display stream."""
+    if scrubber is None:
+        return ""
+    try:
+        return _display_text(scrubber.flush())
+    except Exception:
+        return ""
+
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
@@ -2508,15 +2542,97 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
+def _sanitize_display_payload_value(
+    value: Any,
+    *,
+    event: str,
+    sid: str,
+    path: tuple[Any, ...] = (),
+) -> Any:
+    """Recursively sanitize display-event payload strings.
+
+    The TUI/Desktop transport is an egress surface: anything in an event payload
+    may be rendered immediately by Electron/Ink. Keep memory-context fences out
+    even when a callback bypasses the normal message streaming path.
+    """
+    if isinstance(value, str):
+        if event.endswith(".delta"):
+            return _stream_display_text(
+                _display_event_stream_scrubber(sid, event, path),
+                value,
+            )
+        return _display_text(value)
+    if isinstance(value, list):
+        return [
+            _sanitize_display_payload_value(
+                item,
+                event=event,
+                sid=sid,
+                path=path + (index,),
+            )
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_display_payload_value(
+                item,
+                event=event,
+                sid=sid,
+                path=path + (key,),
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
+def _display_event_stream_scrubber(
+    sid: str,
+    event: str,
+    path: tuple[Any, ...] = (),
+) -> Any:
+    session = _sessions.get(sid)
+    if not isinstance(session, dict):
+        return _new_display_scrubber()
+    scrubbers = session.setdefault("display_event_scrubbers", {})
+    if not isinstance(scrubbers, dict):
+        scrubbers = {}
+        session["display_event_scrubbers"] = scrubbers
+    key = (event, *path)
+    scrubber = scrubbers.get(key)
+    if scrubber is None:
+        scrubber = _new_display_scrubber()
+        scrubbers[key] = scrubber
+    return scrubber
+
+
+def _sanitize_display_event_payload(event: str, sid: str, payload: dict | None) -> dict | None:
+    if payload is None:
+        return None
+    return _sanitize_display_payload_value(
+        dict(payload),
+        event=event,
+        sid=sid,
+    )
+
+
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
-    params: dict = {"type": event, "session_id": sid}
+    payload = _sanitize_display_event_payload(event, sid, payload)
+    params: dict[str, Any] = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+    frame = _event_frame(event, sid, payload)
+    visible_payload = frame["params"].get("payload")
+    if (
+        event.endswith(".delta")
+        and isinstance(visible_payload, dict)
+        and visible_payload.get("text") == ""
+    ):
+        return
+    write_json(frame)
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -9313,7 +9429,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # this projection.
         if m.get("display_kind") == "hidden":
             continue
-        content_text = _coerce_message_text(m.get("content"))
+        content_text = _display_text(_coerce_message_text(m.get("content")))
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
@@ -9356,10 +9472,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             "reasoning_details",
             "codex_reasoning_items",
         )
-        has_reasoning = role == "assistant" and any(
-            m.get(key) for key in reasoning_keys
-        )
-        if not content_text.strip() and not has_reasoning:
+        reasoning = {
+            key: _sanitize_display_value(m.get(key))
+            for key in reasoning_keys
+            if key in m and m.get(key) is not None
+        } if role == "assistant" else {}
+        visible_reasoning = {key: value for key, value in reasoning.items() if value}
+        if not content_text.strip() and not visible_reasoning:
             continue
         msg = {"role": role, "text": content_text}
         # Persisted authoring time (Unix seconds) for display.timestamps
@@ -9382,10 +9501,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 # turn by ordinal, so no client needs it.
                 msg["text"] = invocation
                 msg["display_kind"] = "skill_invocation"
-        if role == "assistant":
-            for key in reasoning_keys:
-                if key in m and m.get(key) is not None:
-                    msg[key] = m.get(key)
+        msg.update(visible_reasoning)
         # Forward display-only timeline metadata so the TUI can render
         # model switches and delegation completions as events instead of
         # opaque user messages, and hide compaction handoffs entirely.
@@ -12691,15 +12807,23 @@ def _run_prompt_submit(
             # state, so it cannot live in the (byte-stable) system prompt.
             run_message = _prepend_note(run_message, _hud_surface_note(session))
 
-            def _stream(delta):
+            stream_scrubber = _new_display_scrubber()
+
+            def _emit_stream_delta(delta: Any) -> None:
+                visible = _stream_display_text(stream_scrubber, delta)
+                if not visible:
+                    return
                 with session["history_lock"]:
-                    _append_inflight_delta(session, delta)
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
+                    _append_inflight_delta(session, visible)
+                payload = {"text": visible}
+                if streamer and (r := streamer.feed(visible)) is not None:
                     payload["rendered"] = r
-                if tts_queue is not None and isinstance(delta, str):
-                    tts_queue.put(delta)
+                if tts_queue is not None:
+                    tts_queue.put(visible)
                 _emit("message.delta", sid, payload)
+
+            def _stream(delta):
+                _emit_stream_delta(delta)
 
             # Surface interim assistant text (commentary emitted alongside
             # tool calls, or the attempted final answer before a verify-on-stop
@@ -12762,6 +12886,7 @@ def _run_prompt_submit(
                 # message.complete.
                 _usage_stop.set()
                 _usage_thread.join()
+            _emit_stream_delta(_flush_stream_display_text(stream_scrubber))
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -12904,7 +13029,7 @@ def _run_prompt_submit(
                     sid, session, clear_pending_title=False, restart_slash_worker=True,
                 )
 
-                raw = result.get("final_response", "")
+                raw = _display_text(result.get("final_response", ""))
                 status = (
                     "interrupted"
                     if result.get("interrupted")
@@ -12935,7 +13060,7 @@ def _run_prompt_submit(
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
             else:
-                raw = str(result)
+                raw = _display_text(result)
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
