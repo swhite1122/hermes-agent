@@ -507,15 +507,23 @@ def _invoke_agent(
     """Wire the streaming callbacks and run the conversation into ``st.result``."""
     agent = st.agent
 
-    def _stream(delta):
+    stream_scrubber = _new_display_scrubber()
+
+    def _emit_stream_delta(delta: Any) -> None:
+        visible = _stream_display_text(stream_scrubber, delta)
+        if not visible:
+            return
         with session["history_lock"]:
-            _append_inflight_delta(session, delta)
-        payload = {"text": delta}
-        if streamer and (r := streamer.feed(delta)) is not None:
+            _append_inflight_delta(session, visible)
+        payload = {"text": visible}
+        if streamer and (r := streamer.feed(visible)) is not None:
             payload["rendered"] = r
-        if st.tts_queue is not None and isinstance(delta, str):
-            st.tts_queue.put(delta)
+        if st.tts_queue is not None:
+            st.tts_queue.put(visible)
         _emit("message.delta", sid, payload)
+
+    def _stream(delta):
+        _emit_stream_delta(delta)
 
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
     # by the desktop as its own segment instead of being lost to message.complete.
@@ -551,6 +559,7 @@ def _invoke_agent(
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
         _usage_stop.set()
         _usage_thread.join()
+        _emit_stream_delta(_flush_stream_display_text(stream_scrubber))
 
 
 def _absorb_turn_result(
@@ -621,6 +630,8 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     settles the hosted-room terminal receipt."""
     result, agent = st.result, st.agent
     raw, status, last_reasoning = _turn_outcome(result)
+    raw = _display_text(raw)
+    last_reasoning = _sanitize_display_value(last_reasoning)
     payload = {"text": raw, "usage": _get_usage(agent), "status": status}
     if last_reasoning:
         payload["reasoning"] = last_reasoning

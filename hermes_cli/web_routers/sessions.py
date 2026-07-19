@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
+from hermes_cli.display_sanitizer import sanitize_display_value
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
@@ -551,7 +552,7 @@ async def get_session_messages(
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     sid, _limit, messages = result
-    projected_messages = _project_for_display(messages)
+    projected_messages = sanitize_display_value(_project_for_display(messages))
     return {
         "session_id": sid,
         "messages": projected_messages,
