@@ -34,6 +34,11 @@ from agent.reasoning_effort import clamp_effort, route_supported_efforts
 from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: F401
+from hermes_cli.display_sanitizer import (
+    MemoryContextScrubber as _MemoryContextScrubber,
+    sanitize_display_text as _display_text,
+    sanitize_display_value as _sanitize_display_value,
+)
 from tui_gateway import git_probe
 from tui_gateway._env import env_float, env_int
 from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start  # noqa: F401
@@ -645,7 +650,75 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
+def _new_display_scrubber() -> Any:
+    """Create a stateful display scrubber for split streaming deltas."""
+    return _MemoryContextScrubber()
+
+
+def _stream_display_text(scrubber: Any, text: Any) -> str:
+    """Scrub one streaming chunk before it reaches TUI/Desktop renderers."""
+    if text is None:
+        return ""
+    raw = str(text)
+    if not raw:
+        return ""
+    try:
+        return scrubber.feed(raw)
+    except Exception:
+        return ""
+
+
+def _flush_stream_display_text(scrubber: Any) -> str:
+    """Flush held partial-tag text at the end of a display stream."""
+    if scrubber is None:
+        return ""
+    try:
+        return _display_text(scrubber.flush())
+    except Exception:
+        return ""
+
+
+def _sanitize_display_payload_value(
+    value: Any, *, event: str, sid: str, path: tuple[Any, ...] = (),
+) -> Any:
+    """Recursively scrub user-visible event data before transport egress."""
+    if isinstance(value, str):
+        if event.endswith(".delta"):
+            return _stream_display_text(_display_event_stream_scrubber(sid, event, path), value)
+        return _display_text(value)
+    if isinstance(value, list):
+        return [_sanitize_display_payload_value(item, event=event, sid=sid, path=path + (index,))
+                for index, item in enumerate(value)]
+    if isinstance(value, dict):
+        return {key: _sanitize_display_payload_value(item, event=event, sid=sid, path=path + (key,))
+                for key, item in value.items()}
+    return value
+
+
+def _display_event_stream_scrubber(sid: str, event: str, path: tuple[Any, ...] = ()) -> Any:
+    session = _sessions.get(sid)
+    if not isinstance(session, dict):
+        return _new_display_scrubber()
+    scrubbers = session.setdefault("display_event_scrubbers", {})
+    if not isinstance(scrubbers, dict):
+        scrubbers = {}
+        session["display_event_scrubbers"] = scrubbers
+    key = (event, *path)
+    scrubber = scrubbers.get(key)
+    if scrubber is None:
+        scrubber = _new_display_scrubber()
+        scrubbers[key] = scrubber
+    return scrubber
+
+
+def _sanitize_display_event_payload(event: str, sid: str, payload: dict | None) -> dict | None:
+    if payload is None:
+        return None
+    return _sanitize_display_payload_value(dict(payload), event=event, sid=sid)
+
+
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
+    payload = _sanitize_display_event_payload(event, sid, payload)
     _contracts.check_payload(event, payload)
     params: dict = {"type": event, "session_id": sid, **({"payload": payload} if payload is not None else {})}
     return {"jsonrpc": "2.0", "method": "event", "params": params}
@@ -655,7 +728,11 @@ def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
     from agent.notification_presentation import event_presentation_muted
     if event_presentation_muted(event, sid):
         return False
-    return write_json(_event_frame(event, sid, payload))
+    frame = _event_frame(event, sid, payload)
+    visible_payload = frame["params"].get("payload")
+    if event.endswith(".delta") and isinstance(visible_payload, dict) and visible_payload.get("text") == "":
+        return True
+    return write_json(frame)
 
 
 from tui_gateway import server_requests as _server_requests  # noqa: E402
