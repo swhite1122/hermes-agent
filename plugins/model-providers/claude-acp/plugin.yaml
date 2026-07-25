@@ -1,0 +1,5 @@
+name: claude-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Claude Agent SDK through a local ACP subprocess
+author: local
