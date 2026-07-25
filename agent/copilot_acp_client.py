@@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -45,6 +46,22 @@ _DEPRECATION_MARKERS = (
     "has been deprecated",
     "no commands will be executed",
 )
+
+
+def _request_timeout_policy(method: str, timeout_seconds: float) -> tuple[float, float]:
+    """Return (absolute timeout, idle timeout) for an ACP JSON-RPC request."""
+    try:
+        supplied = float(timeout_seconds)
+    except (TypeError, ValueError):
+        supplied = _DEFAULT_TIMEOUT_SECONDS
+    if not math.isfinite(supplied) or supplied <= 0:
+        supplied = _DEFAULT_TIMEOUT_SECONDS
+
+    if method == "session/prompt":
+        return supplied, min(supplied, 300.0)
+
+    capped = min(supplied, 30.0)
+    return capped, capped
 
 
 def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
@@ -633,15 +650,30 @@ class CopilotACPClient:
             proc.stdin.write(json.dumps(payload) + "\n")
             proc.stdin.flush()
 
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
+            absolute_timeout, idle_timeout = _request_timeout_policy(
+                method,
+                timeout_seconds,
+            )
+            now = time.monotonic()
+            absolute_deadline = now + absolute_timeout
+            idle_deadline = now + idle_timeout
+            while True:
+                now = time.monotonic()
+                if now >= absolute_deadline or now >= idle_deadline:
+                    break
                 if proc.poll() is not None:
                     break
                 try:
-                    msg = inbox.get(timeout=0.1)
+                    wait_timeout = min(
+                        0.1,
+                        max(0.0, absolute_deadline - now),
+                        max(0.0, idle_deadline - now),
+                    )
+                    msg = inbox.get(timeout=wait_timeout)
                 except queue.Empty:
                     continue
 
+                idle_deadline = time.monotonic() + idle_timeout
                 if self._handle_server_message(
                     msg,
                     process=proc,
