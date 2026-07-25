@@ -2145,6 +2145,83 @@ def _model_flow_copilot_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+
+def _model_flow_claude_acp(config, current_model=""):
+    """Claude subscription model selection through the local ACP adapter."""
+    from agent.claude_acp_client import ClaudeACPClient
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+
+    del config
+    provider_id = "claude-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = (
+        status.get("resolved_command")
+        or status.get("command")
+        or "claude-agent-acp"
+    )
+
+    print("  Claude Agent ACP uses the official Claude Agent SDK locally.")
+    print("  Authentication stays in your existing Claude credential store.")
+    print("  ANTHROPIC_API_KEY must be unset to prevent API-key billing.")
+    print(f"  Command: {resolved_command}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+        client = ClaudeACPClient(
+            api_key=creds.get("api_key"),
+            base_url=creds.get("base_url"),
+            command=creds.get("command"),
+            args=list(creds.get("args") or []),
+        )
+        model_list = client.discover_models(timeout_seconds=30.0)
+    except Exception as exc:
+        print(f"  ⚠ Could not discover Claude ACP models: {exc}")
+        return
+
+    if not model_list:
+        print("  ⚠ Claude ACP did not advertise any selectable models.")
+        return
+
+    print(f"  Found {len(model_list)} model(s) from the Claude ACP session")
+    selected = _prompt_model_selection(
+        model_list,
+        current_model=current_model if current_model in model_list else "",
+        confirm_provider=provider_id,
+        confirm_base_url=creds.get("base_url", "acp://claude"),
+        confirm_api_key="",
+    )
+    if not selected:
+        print("No change.")
+        return
+    if selected not in model_list:
+        print(f"  ⚠ Model '{selected}' was not advertised by Claude ACP; no change.")
+        return
+
+    _save_model_choice(selected)
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = creds.get("base_url", "acp://claude")
+    model["api_mode"] = "chat_completions"
+    clear_model_endpoint_credentials(model, clear_api_mode=False)
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.
 

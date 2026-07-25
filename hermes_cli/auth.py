@@ -134,6 +134,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CLAUDE_ACP_BASE_URL = "acp://claude"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 DEFAULT_ACTUAL_BASE_URL = "https://api.actual.inc/v1"
 DEFAULT_ACTUAL_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
@@ -304,6 +305,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "claude-acp": ProviderConfig(
+        id="claude-acp",
+        name="Claude Agent ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_ACP_BASE_URL,
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -2826,6 +2833,7 @@ def resolve_provider(
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
         "claude": "anthropic", "claude-code": "anthropic",
+        "claude-agent-acp": "claude-acp",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
@@ -8000,30 +8008,44 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "claude-acp":
+        command = "claude-agent-acp"
+        args: list[str] = []
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
     auth_verified, auth_source = _external_process_auth_evidence(provider_id)
+    configured = bool(
+        resolved_command
+        or base_url.startswith("acp+tcp://")
+    )
+    billing_guard = provider_id == "claude-acp" and bool(
+        os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    )
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": configured and not billing_guard,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": configured and not billing_guard,
         "auth_verified": auth_verified,
         "auth_source": auth_source,
+        **({
+            "error": "ANTHROPIC_API_KEY is set; unset it to prevent API-key billing."
+        } if billing_guard else {}),
     }
 
 
@@ -8044,6 +8066,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
+
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
     pconfig = PROVIDER_REGISTRY.get(target)
@@ -8255,6 +8278,15 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     default_command = str(getattr(profile, "process_command", "") or "")
     default_args = list(getattr(profile, "process_args", ()) or [])
     args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
+
+    if provider_id == "claude-acp" and os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        raise AuthError(
+            "Claude Agent ACP refused to start because ANTHROPIC_API_KEY is set. "
+            "Unset it to prevent Anthropic API-key billing; this provider uses "
+            "the existing Claude subscription credential store.",
+            provider=provider_id,
+            code="claude_acp_api_billing_guard",
+        )
 
     command = ""
     for _var in command_env_vars:
