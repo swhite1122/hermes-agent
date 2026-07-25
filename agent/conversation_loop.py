@@ -3181,7 +3181,7 @@ def run_conversation(
                 # excluded.  Mirror the ACP exclusion used for Responses API
                 # upgrade (lines ~1083-1085).
                 elif (
-                    agent.provider in {"copilot-acp"}
+                    agent.provider in {"copilot-acp", "claude-acp"}
                     or str(agent.base_url or "").lower().startswith("acp://")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
                 ):

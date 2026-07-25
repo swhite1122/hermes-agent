@@ -349,6 +349,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    # Source of truth is the live ACP session model config option. This empty
+    # entry only keeps generic catalog consumers aware of the provider.
+    "claude-acp": [],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -1246,6 +1249,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("claude-acp",     "Claude Agent ACP",         "Claude Agent ACP (Official Claude Agent SDK using local Claude subscription login)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
@@ -1326,6 +1330,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
     "tencent":  ("Tencent Hy",      "Hy4 / Hy3 via TokenHub & TokenPlan", ["tencent-tokenhub", "tencent-tokenplan"]),
+    "anthropic": ("Anthropic",       "Direct API or Claude subscription through ACP",    ["anthropic", "claude-acp"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.
@@ -1410,6 +1415,7 @@ _PROVIDER_ALIASES = {
     "github-model": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "claude-agent-acp": "claude-acp",
     "google": "gemini",
     "google-gemini": "gemini",
     "google-ai-studio": "gemini",
@@ -3964,6 +3970,15 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         except Exception:
             access_token = None
         return get_codex_model_ids(access_token=access_token)
+    if normalized == "claude-acp":
+        try:
+            from agent.claude_acp_client import ClaudeACPClient
+
+            return ClaudeACPClient().discover_models(timeout_seconds=30.0)
+        except Exception:
+            # No static fallback: the ACP session is authoritative for account
+            # availability and exact model ids.
+            return []
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
