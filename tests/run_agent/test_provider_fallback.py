@@ -131,6 +131,44 @@ class TestFallbackChainAdvancement:
         assert agent._pending_fallback_notice == [expected]
         assert agent._retry_status_buffer[-1] == ("status", expected)
 
+    def test_claude_acp_failure_arms_cross_turn_cooldown(self):
+        fbs = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "claude-acp"
+        agent.model = "claude-opus-5"
+        agent._primary_runtime = {"provider": "claude-acp"}
+        agent._rate_limited_until = 0
+
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=100.0),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-5.6-sol"),
+            ),
+        ):
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
+
+        assert agent._rate_limited_until == 100.0 + 900.0
+
+    def test_claude_acp_failure_arms_cooldown_even_when_fallback_resolution_fails(self):
+        fbs = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "claude-acp"
+        agent.model = "claude-opus-5"
+        agent._primary_runtime = {"provider": "claude-acp"}
+        agent._rate_limited_until = 0
+
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=200.0),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=RuntimeError("fallback unavailable"),
+            ),
+        ):
+            assert agent._try_activate_fallback(FailoverReason.auth_permanent) is False
+
+        assert agent._rate_limited_until == 200.0 + 900.0
+
     def test_records_sequential_switches_in_order(self):
         agent = _make_agent(
             fallback_model=[
