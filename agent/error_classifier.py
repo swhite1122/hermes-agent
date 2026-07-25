@@ -946,6 +946,58 @@ def classify_api_error(
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
+    if provider_lower == "claude-acp":
+        if any(
+            pattern in error_msg
+            for pattern in (
+                "not logged in",
+                "authentication has expired",
+                "login required",
+                "run /login",
+                "anthropic_api_key is set",
+            )
+        ):
+            return _result(
+                FailoverReason.auth_permanent,
+                retryable=False,
+                should_fallback=True,
+            )
+
+        if (
+            "claude agent acp process exited before responding to" in error_msg
+            or "claude agent acp process exited early" in error_msg
+        ):
+            return _result(
+                FailoverReason.timeout,
+                retryable=True,
+                should_fallback=False,
+            )
+
+        if "timed out waiting for claude agent acp response" in error_msg:
+            return _result(
+                FailoverReason.timeout,
+                retryable=False,
+                should_fallback=True,
+            )
+
+        if (
+            "claude agent acp actual-model telemetry was missing" in error_msg
+            or (
+                "claude agent acp requested" in error_msg
+                and "sdk answered" in error_msg
+            )
+            or "claude agent acp provider telemetry was missing" in error_msg
+            or (
+                "claude agent acp reported serving provider" in error_msg
+                and "firstparty" in error_msg
+            )
+        ):
+            return _result(
+                FailoverReason.model_not_found,
+                retryable=False,
+                should_fallback=True,
+            )
+
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged
     # just reproduces the same refusal and burns paid attempts. Must run
