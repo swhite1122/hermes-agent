@@ -162,6 +162,44 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _redact_acp_error_text(value: Any) -> str:
+    """Render subprocess/protocol errors without leaking credentials."""
+    return redact_sensitive_text(str(value or ""), force=True)
+
+
+def _find_model_config_option(config_options: Any) -> dict[str, Any] | None:
+    """Return ACP's model selector by semantic category or conventional id."""
+    if not isinstance(config_options, list):
+        return None
+    for option in config_options:
+        if not isinstance(option, dict):
+            continue
+        if option.get("category") == "model" or option.get("id") == "model":
+            return option
+    return None
+
+
+def _model_option_values(option: dict[str, Any] | None) -> list[str]:
+    """Flatten grouped ACP select options while preserving exact model ids."""
+    if not isinstance(option, dict):
+        return []
+    raw_options = option.get("options")
+    if not isinstance(raw_options, list):
+        return []
+    values: list[str] = []
+    for item in raw_options:
+        candidates = item.get("options") if isinstance(item, dict) else None
+        if not isinstance(candidates, list):
+            candidates = [item]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            value = candidate.get("value")
+            if isinstance(value, str) and value and value not in values:
+                values.append(value)
+    return values
+
+
 def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -311,6 +349,68 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self.last_advertised_models: list[str] = []
+        self.last_confirmed_model: str = ""
+        self.last_picker_confirmed_model: str = ""
+        self.last_picker_selector: str = ""
+        self.last_actual_model: str = ""
+
+    @property
+    def _provider_label(self) -> str:
+        return "Copilot ACP"
+
+    def _build_subprocess_env(self) -> dict[str, str]:
+        return _build_subprocess_env()
+
+    def _session_new_params(self) -> dict[str, Any]:
+        return {
+            "cwd": self._acp_cwd,
+            "mcpServers": [],
+        }
+
+    def _model_selection_values(
+        self, model_option: dict[str, Any] | None
+    ) -> list[str]:
+        return _model_option_values(model_option)
+
+    def _confirmed_model_from_options(self, config_options: Any) -> str:
+        option = _find_model_config_option(config_options)
+        if not isinstance(option, dict):
+            return ""
+        current = option.get("currentValue")
+        return current if isinstance(current, str) else ""
+
+    def _raw_model_selector_from_options(self, config_options: Any) -> str:
+        return self._confirmed_model_from_options(config_options)
+
+    def _model_selector_for_request(self, requested_model: str) -> str:
+        return requested_model
+
+    def _stable_answering_model(self, actual_model: str) -> str:
+        return actual_model
+
+    def _handle_extension_notification(
+        self, message: dict[str, Any], model_state: dict[str, Any] | None
+    ) -> bool:
+        del message, model_state
+        return False
+
+    def _validate_answering_model(
+        self, requested_model: str | None, confirmed_model: str
+    ) -> None:
+        del requested_model, confirmed_model
+
+    def _validate_serving_provider(
+        self, actual_model: str, model_state: dict[str, Any]
+    ) -> None:
+        del actual_model, model_state
+
+    def _command_start_error(self) -> str:
+        return (
+            f"Could not start Copilot ACP command '{self._acp_command}'. "
+            "Install GitHub Copilot CLI or set "
+            "HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        )
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
@@ -326,6 +426,7 @@ class CopilotACPClient:
         except Exception:
             try:
                 proc.kill()
+                proc.wait(timeout=2)
             except Exception:
                 pass
 
@@ -362,10 +463,13 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
+        result = self._execute_prompt(
             prompt_text,
+            model=model,
             timeout_seconds=_effective_timeout,
         )
+        response_text = result.text
+        reasoning_text = result.reasoning
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
@@ -387,13 +491,52 @@ class CopilotACPClient:
         completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
-            model=model or "copilot-acp",
+            model=result.confirmed_model or model or "copilot-acp",
         )
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
 
+    def _execute_prompt(
+        self,
+        prompt_text: str,
+        *,
+        model: str | None,
+        timeout_seconds: float,
+    ) -> SimpleNamespace:
+        response_text, reasoning_text = self._run_prompt(
+            prompt_text,
+            timeout_seconds=timeout_seconds,
+        )
+        confirmed_model = model or "copilot-acp"
+        self.last_confirmed_model = confirmed_model
+        return SimpleNamespace(
+            text=response_text,
+            reasoning=reasoning_text,
+            advertised_models=[],
+            confirmed_model=confirmed_model,
+        )
+
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+        result = self._run_acp_session(
+            prompt_text=prompt_text,
+            timeout_seconds=timeout_seconds,
+        )
+        return result.text, result.reasoning
+
+    def _run_acp_session(
+        self,
+        *,
+        prompt_text: str | None,
+        timeout_seconds: float,
+        requested_model: str | None = None,
+        require_model_config: bool = False,
+    ) -> SimpleNamespace:
+        # Build and validate the child environment before any transport probe.
+        # Provider subclasses use this hook for fail-closed billing/auth guards;
+        # those must run before even a short-lived CLI subprocess is attempted.
+        subprocess_env = self._build_subprocess_env()
+
         # Fast-fail when the CLI doesn't support the ACP args we'd pass.
         # Without this guard, a CLI like Claude Code v2.x exits with
         # ``error: unknown option '--acp'`` immediately, then the parent
@@ -429,18 +572,17 @@ class CopilotACPClient:
                 text=True, encoding='utf-8', errors='replace',
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=subprocess_env,
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
-            ) from exc
+            raise RuntimeError(self._command_start_error()) from exc
 
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+            raise RuntimeError(
+                f"{self._provider_label} process did not expose stdin/stdout pipes."
+            )
 
         self.is_closed = False
         with self._active_process_lock:
@@ -471,7 +613,14 @@ class CopilotACPClient:
 
         next_id = 0
 
-        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
+        def _request(
+            method: str,
+            params: dict[str, Any],
+            *,
+            text_parts: list[str] | None = None,
+            reasoning_parts: list[str] | None = None,
+            model_state: dict[str, Any] | None = None,
+        ) -> Any:
             nonlocal next_id
             next_id += 1
             request_id = next_id
@@ -499,6 +648,7 @@ class CopilotACPClient:
                     cwd=self._acp_cwd,
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
+                    model_state=model_state,
                 ):
                     continue
 
@@ -507,13 +657,17 @@ class CopilotACPClient:
                 if "error" in msg:
                     err = msg.get("error") or {}
                     raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
+                        f"{self._provider_label} {method} failed: "
+                        f"{_redact_acp_error_text(err.get('message') or err)}"
                     )
                 return msg.get("result")
 
-            stderr_text = "\n".join(stderr_tail).strip()
-            if proc.poll() is not None and stderr_text:
-                if _is_gh_copilot_deprecation_message(stderr_text):
+            raw_stderr_text = "\n".join(stderr_tail).strip()
+            stderr_text = _redact_acp_error_text(raw_stderr_text)
+            if self.is_closed:
+                raise RuntimeError(f"{self._provider_label} request was cancelled.")
+            if proc.poll() is not None and raw_stderr_text:
+                if _is_gh_copilot_deprecation_message(raw_stderr_text):
                     raise RuntimeError(
                         "Hermes ACP mode requires the NEW GitHub Copilot CLI "
                         "(github.com/github/copilot-cli), but the binary it just "
@@ -528,8 +682,16 @@ class CopilotACPClient:
                         "directly with a Copilot subscription token) via `hermes setup`.\n\n"
                         f"Original error:\n{stderr_text}"
                     )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise RuntimeError(
+                    f"{self._provider_label} process exited early: {stderr_text}"
+                )
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"{self._provider_label} process exited before responding to {method}."
+                )
+            raise TimeoutError(
+                f"Timed out waiting for {self._provider_label} response to {method}."
+            )
 
         try:
             _request(
@@ -549,16 +711,76 @@ class CopilotACPClient:
                     },
                 },
             )
-            session = _request(
-                "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                },
-            ) or {}
+            session = _request("session/new", self._session_new_params()) or {}
             session_id = str(session.get("sessionId") or "").strip()
             if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+                raise RuntimeError(
+                    f"{self._provider_label} did not return a sessionId."
+                )
+
+            model_option = _find_model_config_option(session.get("configOptions"))
+            advertised_models = self._model_selection_values(model_option)
+            self.last_advertised_models = list(advertised_models)
+            current_model = self._confirmed_model_from_options(
+                session.get("configOptions")
+            )
+            current_selector = self._raw_model_selector_from_options(
+                session.get("configOptions")
+            )
+            model_state: dict[str, Any] = {
+                "confirmed_model": current_model,
+                "confirmed_selector": current_selector,
+            }
+
+            if require_model_config and not model_option:
+                raise RuntimeError(
+                    f"{self._provider_label} session did not advertise a model "
+                    "config option (id/category 'model')."
+                )
+            if requested_model:
+                if not model_option or requested_model not in advertised_models:
+                    raise ValueError(
+                        f"Requested model '{requested_model}' is not advertised by "
+                        f"{self._provider_label}. Available models: "
+                        f"{', '.join(advertised_models) or 'none'}"
+                    )
+                config_id = str(model_option.get("id") or "").strip()
+                requested_selector = self._model_selector_for_request(requested_model)
+                set_result = _request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": session_id,
+                        "configId": config_id,
+                        "value": requested_selector,
+                    },
+                    model_state=model_state,
+                ) or {}
+                confirmed = self._confirmed_model_from_options(
+                    set_result.get("configOptions")
+                ).strip()
+                if confirmed != requested_model:
+                    raise RuntimeError(
+                        f"{self._provider_label} did not confirm requested model "
+                        f"'{requested_model}' (confirmed: '{confirmed or 'unknown'}')."
+                    )
+                model_state["confirmed_model"] = confirmed
+                model_state["confirmed_selector"] = (
+                    self._raw_model_selector_from_options(
+                        set_result.get("configOptions")
+                    )
+                )
+
+            if prompt_text is None:
+                self.last_confirmed_model = model_state["confirmed_model"]
+                self.last_picker_confirmed_model = model_state["confirmed_model"]
+                self.last_picker_selector = model_state["confirmed_selector"]
+                self.last_actual_model = ""
+                return SimpleNamespace(
+                    text="",
+                    reasoning="",
+                    advertised_models=advertised_models,
+                    confirmed_model=model_state["confirmed_model"],
+                )
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
@@ -575,8 +797,28 @@ class CopilotACPClient:
                 },
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
+                model_state=model_state,
             )
-            return "".join(text_parts), "".join(reasoning_parts)
+            picker_confirmed_model = str(model_state["confirmed_model"]).strip()
+            actual_model = str(model_state.get("actual_model") or "").strip()
+            stable_actual_model = self._stable_answering_model(actual_model)
+            confirmed_model = stable_actual_model or picker_confirmed_model
+            self.last_picker_confirmed_model = picker_confirmed_model
+            self.last_picker_selector = str(
+                model_state.get("confirmed_selector") or ""
+            ).strip()
+            self.last_actual_model = actual_model
+            if stable_actual_model:
+                self.last_confirmed_model = stable_actual_model
+            self._validate_answering_model(requested_model, actual_model)
+            self._validate_serving_provider(actual_model, model_state)
+            self.last_confirmed_model = confirmed_model
+            return SimpleNamespace(
+                text="".join(text_parts),
+                reasoning="".join(reasoning_parts),
+                advertised_models=advertised_models,
+                confirmed_model=confirmed_model,
+            )
         finally:
             self.close()
 
@@ -588,7 +830,10 @@ class CopilotACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        model_state: dict[str, Any] | None = None,
     ) -> bool:
+        if self._handle_extension_notification(msg, model_state):
+            return True
         method = msg.get("method")
         if not isinstance(method, str):
             return False
@@ -605,6 +850,17 @@ class CopilotACPClient:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
                 reasoning_parts.append(chunk_text)
+            elif kind == "config_option_update" and model_state is not None:
+                confirmed = self._confirmed_model_from_options(
+                    update.get("configOptions")
+                )
+                if confirmed:
+                    model_state["confirmed_model"] = confirmed
+                    model_state["confirmed_selector"] = (
+                        self._raw_model_selector_from_options(
+                            update.get("configOptions")
+                        )
+                    )
             return True
 
         if process.stdin is None:

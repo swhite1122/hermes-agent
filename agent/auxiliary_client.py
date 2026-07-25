@@ -639,6 +639,7 @@ _PROVIDER_ALIASES = {
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
     "claude-code": "anthropic",
+    "claude-agent-acp": "claude-acp",
     "github": "copilot",
     "github-copilot": "copilot",
     "github-model": "copilot",
@@ -7120,26 +7121,30 @@ def resolve_provider_client(
             or _read_main_model_for_aux(),
             provider,
         )
-        if provider == "copilot-acp":
+        if provider in {"copilot-acp", "claude-acp"}:
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             if not final_model:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but no model "
-                    "was provided or configured"
+                    "resolve_provider_client: %s requested but no model "
+                    "was provided or configured",
+                    provider,
                 )
                 return None, None
             if not api_key or not base_url:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but external "
-                    "process credentials are incomplete"
+                    "resolve_provider_client: %s requested but external process "
+                    "credentials are incomplete", provider
                 )
                 return None, None
-            from agent.copilot_acp_client import CopilotACPClient
+            if provider == "claude-acp":
+                from agent.claude_acp_client import ClaudeACPClient as ACPClient
+            else:
+                from agent.copilot_acp_client import CopilotACPClient as ACPClient
 
-            client = CopilotACPClient(
+            client = ACPClient(
                 api_key=api_key,
                 base_url=base_url,
                 command=command,
@@ -8358,6 +8363,7 @@ def _resolve_task_provider_model(
                 "anthropic",
                 "copilot",
                 "copilot-acp",
+                "claude-acp",
                 "minimax-oauth",
                 "nous",
                 "openai-codex",
