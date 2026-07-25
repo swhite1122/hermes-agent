@@ -49,6 +49,7 @@ _FAMILY_VERSION_RE = re.compile(
     r"\b(opus|sonnet|fable|haiku)\s+(\d+(?:[.-]\d+)?)\b",
     re.IGNORECASE,
 )
+_APPROVED_MODELS = frozenset({"claude-opus-5", "claude-sonnet-5"})
 
 
 def _canonical_selector(option: dict[str, Any]) -> str:
@@ -72,7 +73,7 @@ def _canonical_options(model_option: dict[str, Any] | None) -> list[str]:
     values: list[str] = []
     for option in _model_rows(model_option):
         canonical = _canonical_selector(option)
-        if canonical and canonical not in values:
+        if canonical in _APPROVED_MODELS and canonical not in values:
             values.append(canonical)
     return values
 
@@ -144,9 +145,8 @@ class ClaudeACPClient(CopilotACPClient):
     def _command_start_error(self) -> str:
         return (
             f"Could not start Claude Agent ACP command '{self._acp_command}'. "
-            "Install the authorized adapter with "
-            "`npm install -g @agentclientprotocol/claude-agent-acp@0.62.0` "
-            "and ensure `claude-agent-acp` is on PATH."
+            "Install @agentclientprotocol/claude-agent-acp@0.62.0 in the stable "
+            "Hermes provider directory or ensure `claude-agent-acp` is on PATH."
         )
 
     def _build_subprocess_env(self) -> dict[str, str]:
@@ -203,7 +203,7 @@ class ClaudeACPClient(CopilotACPClient):
         for option in rows:
             selector = str(option.get("value") or "").strip()
             canonical = _canonical_selector(option)
-            if not selector or not canonical:
+            if not selector or canonical not in _APPROVED_MODELS:
                 continue
             metadata: dict[str, Any] = {"selector": selector}
             context_window = _context_window_from_option(option)
