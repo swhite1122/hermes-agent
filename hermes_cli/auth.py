@@ -135,6 +135,10 @@ DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
 DEFAULT_CLAUDE_ACP_BASE_URL = "acp://claude"
+CLAUDE_ACP_ADAPTER_RELATIVE_PATH = Path(
+    "providers/claude-acp/node_modules/.bin/claude-agent-acp"
+)
+CLAUDE_AUTH_STATUS_TIMEOUT_SECONDS = 5.0
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 DEFAULT_ACTUAL_BASE_URL = "https://api.actual.inc/v1"
 DEFAULT_ACTUAL_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
@@ -7207,6 +7211,59 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _claude_acp_stable_adapter_path() -> Path:
+    return Path(get_hermes_home()) / CLAUDE_ACP_ADAPTER_RELATIVE_PATH
+
+
+def _resolve_claude_acp_adapter_command() -> tuple[str, bool, bool]:
+    """Return (resolved command, stable path exists, stable path is executable)."""
+    stable_path = _claude_acp_stable_adapter_path()
+    stable_exists = stable_path.exists()
+    stable_executable = stable_path.is_file() and os.access(str(stable_path), os.X_OK)
+    if stable_exists:
+        if stable_executable:
+            return str(stable_path), stable_exists, stable_executable
+        return "", stable_exists, stable_executable
+    path_command = shutil.which("claude-agent-acp") or ""
+    return path_command, stable_exists, stable_executable
+
+
+def _probe_claude_login_status(
+    *, timeout_seconds: float = CLAUDE_AUTH_STATUS_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """Probe Claude CLI login status without returning credential material."""
+    try:
+        result = subprocess.run(
+            ["claude", "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Claude auth status probe timed out."
+    except FileNotFoundError:
+        return False, "Claude CLI was not found for auth status probe."
+    except Exception as exc:
+        return False, f"Claude auth status probe failed ({type(exc).__name__})."
+
+    if result.returncode != 0:
+        return False, "Claude auth status probe failed."
+
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False, "Claude auth status output was not valid JSON."
+    if not isinstance(payload, dict):
+        return False, "Claude auth status output was not valid JSON."
+
+    logged_in = payload.get("loggedIn")
+    if logged_in is True or (
+        isinstance(logged_in, str) and logged_in.strip().lower() == "true"
+    ):
+        return True, ""
+    return False, "Claude CLI is not logged in."
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -7216,6 +7273,9 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if provider_id == "claude-acp":
         command = "claude-agent-acp"
         args: list[str] = []
+        resolved_command, stable_exists, _stable_executable = (
+            _resolve_claude_acp_adapter_command()
+        )
     else:
         command = (
             os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
@@ -7224,11 +7284,17 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         )
         raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
         args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        resolved_command = shutil.which(command) if command else None
+        stable_exists = False
+        stable_executable = False
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    resolved_command = shutil.which(command) if command else None
+    installed = bool(
+        resolved_command
+        or (provider_id == "claude-acp" and stable_exists)
+    )
     configured = bool(
         resolved_command
         or (provider_id == "copilot-acp" and base_url.startswith("acp+tcp://"))
@@ -7236,18 +7302,34 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     billing_guard = provider_id == "claude-acp" and bool(
         os.environ.get("ANTHROPIC_API_KEY", "").strip()
     )
+    logged_in = configured and not billing_guard
+    error = ""
+    if provider_id == "claude-acp":
+        if billing_guard:
+            logged_in = False
+            error = "ANTHROPIC_API_KEY is set; unset it to prevent API-key billing."
+        elif not installed:
+            logged_in = False
+            error = (
+                "Could not find 'claude-agent-acp'. Install the Claude ACP "
+                "adapter in Hermes or ensure it is on PATH."
+            )
+        elif not configured:
+            logged_in = False
+            error = "Claude ACP adapter exists but is not executable."
+        else:
+            logged_in, error = _probe_claude_login_status()
     return {
-        "configured": configured and not billing_guard,
+        "configured": configured,
+        "installed": installed,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": configured and not billing_guard,
-        **({
-            "error": "ANTHROPIC_API_KEY is set; unset it to prevent API-key billing."
-        } if billing_guard else {}),
+        "logged_in": logged_in,
+        **({"error": error} if error else {}),
     }
 
 
@@ -7469,6 +7551,9 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             )
         command = "claude-agent-acp"
         args: list[str] = []
+        resolved_command, _stable_exists, _stable_executable = (
+            _resolve_claude_acp_adapter_command()
+        )
     else:
         command = (
             os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
@@ -7477,14 +7562,14 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         )
         raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
         args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
+        resolved_command = shutil.which(command) if command else None
     tcp_allowed = provider_id == "copilot-acp" and base_url.startswith("acp+tcp://")
     if not resolved_command and not tcp_allowed:
         if provider_id == "claude-acp":
             message = (
-                "Could not find 'claude-agent-acp'. Install "
-                "@agentclientprotocol/claude-agent-acp@0.62.0 and ensure its "
-                "executable is on PATH."
+                "Could not find executable 'claude-agent-acp'. Install "
+                "@agentclientprotocol/claude-agent-acp@0.62.0 in Hermes or "
+                "ensure its executable is on PATH."
             )
             code = "missing_claude_acp_cli"
         else:

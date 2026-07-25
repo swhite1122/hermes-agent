@@ -64,6 +64,13 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+_CLAUDE_ACP_FALLBACK_COOLDOWN_S = 900.0
+_CLAUDE_ACP_COOLDOWN_REASONS = {
+    FailoverReason.timeout,
+    FailoverReason.auth,
+    FailoverReason.auth_permanent,
+    FailoverReason.model_not_found,
+}
 
 
 def _context_thread_target(callback):
@@ -2436,6 +2443,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if reason in _CLAUDE_ACP_COOLDOWN_REASONS:
+        primary_provider = (
+            ((getattr(agent, "_primary_runtime", None) or {}).get("provider") or "")
+            .strip()
+            .lower()
+        )
+        current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+        fallback_already_active = bool(getattr(agent, "_fallback_activated", False))
+        if (
+            primary_provider == "claude-acp"
+            and (
+                not fallback_already_active
+                or current_provider == primary_provider
+            )
+        ):
+            existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
+            agent._rate_limited_until = max(
+                existing_cooldown,
+                time.monotonic() + _CLAUDE_ACP_FALLBACK_COOLDOWN_S,
+            )
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

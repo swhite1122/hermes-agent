@@ -78,6 +78,10 @@ for line in sys.stdin:
     elif method == "session/prompt":
         if mode == "hang_prompt":
             time.sleep(60)
+        if mode == "active_slow_prompt":
+            for _ in range(6):
+                emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "."}}}})
+                time.sleep(0.05)
         if mode == "fallback_model":
             current = "claude-fable-5[1m]"
             emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {"sessionUpdate": "config_option_update", "configOptions": config_options(current)}}})
@@ -172,6 +176,98 @@ def test_provider_registration_and_runtime_resolution(monkeypatch):
     assert resolved["command"].endswith("claude-agent-acp")
 
 
+def test_provider_status_uses_stable_adapter_and_real_claude_login(monkeypatch, tmp_path):
+    from hermes_cli import auth
+
+    stable = (
+        tmp_path
+        / "providers"
+        / "claude-acp"
+        / "node_modules"
+        / ".bin"
+        / "claude-agent-acp"
+    )
+    stable.parent.mkdir(parents=True)
+    stable.write_text("#!/bin/sh\n")
+    stable.chmod(0o755)
+
+    monkeypatch.setattr(auth, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(auth.shutil, "which", lambda _command: None)
+    monkeypatch.setattr(
+        auth.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": '{"loggedIn": false}', "stderr": ""},
+        )(),
+    )
+
+    status = auth.get_external_process_provider_status("claude-acp")
+
+    assert status["configured"] is True
+    assert status["logged_in"] is False
+    assert status["resolved_command"] == str(stable)
+    assert "not logged in" in status["error"].lower()
+
+
+def test_claude_auth_probe_failure_does_not_hide_installed_provider(monkeypatch, tmp_path):
+    from hermes_cli import auth
+
+    monkeypatch.setattr(auth, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(auth.shutil, "which", lambda _command: "/usr/bin/claude-agent-acp")
+
+    def timeout(*args, **kwargs):
+        raise auth.subprocess.TimeoutExpired(cmd="claude", timeout=5)
+
+    monkeypatch.setattr(auth.subprocess, "run", timeout)
+
+    status = auth.get_external_process_provider_status("claude-acp")
+
+    assert status["configured"] is True
+    assert status["logged_in"] is False
+    assert "timed out" in status["error"].lower()
+
+
+def test_provider_status_fails_closed_for_non_executable_stable_adapter(monkeypatch, tmp_path):
+    from hermes_cli import auth
+
+    stable = (
+        tmp_path
+        / "providers"
+        / "claude-acp"
+        / "node_modules"
+        / ".bin"
+        / "claude-agent-acp"
+    )
+    stable.parent.mkdir(parents=True)
+    stable.write_text("not executable\n")
+    stable.chmod(0o644)
+
+    monkeypatch.setattr(auth, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        auth.shutil,
+        "which",
+        lambda _command: "/untrusted/path/claude-agent-acp",
+    )
+    monkeypatch.setattr(
+        auth.subprocess,
+        "run",
+        lambda *args, **kwargs: type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": '{"loggedIn": true}', "stderr": ""},
+        )(),
+    )
+
+    status = auth.get_external_process_provider_status("claude-acp")
+
+    assert status["installed"] is True
+    assert status["configured"] is False
+    assert status["logged_in"] is False
+    assert "not executable" in status["error"].lower()
+
+
 def test_subprocess_invocation_uses_argument_array_without_shell(monkeypatch, tmp_path):
     from agent.claude_acp_client import ClaudeACPClient
 
@@ -196,14 +292,27 @@ def test_subprocess_invocation_uses_argument_array_without_shell(monkeypatch, tm
     assert captured["kwargs"].get("shell", False) is False
 
 
-def test_model_config_discovery_preserves_exact_ids(tmp_path, monkeypatch):
+def test_model_config_discovery_exposes_only_approved_ids_and_keeps_raw_selectors(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     client, _ = _client(tmp_path)
     assert client.discover_models(timeout_seconds=2) == [
         "claude-opus-5",
-        "claude-fable-5",
         "claude-sonnet-5",
     ]
+    assert "claude-fable-5[1m]" in client.last_raw_advertised_models
+    assert "claude-fable-5" not in client.last_model_metadata
+
+
+def test_fable_is_rejected_before_prompt(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client, log = _client(tmp_path)
+    with pytest.raises(ValueError, match="claude-fable-5.*not advertised"):
+        client.chat.completions.create(
+            model="claude-fable-5",
+            messages=[{"role": "user", "content": "hello"}],
+            timeout=2,
+        )
+    assert "session/prompt" not in [item["method"] for item in _requests(log)]
 
 
 def test_session_disables_claude_transcript_persistence(tmp_path):
@@ -314,6 +423,123 @@ def test_timeout_terminates_and_reaps_process(tmp_path, monkeypatch):
     _assert_pid_exited(pid)
     assert client._active_process is None
     assert client.is_closed is True
+
+
+def test_request_timeout_policy_caps_control_calls_and_detects_idle_prompts():
+    from agent.copilot_acp_client import _request_timeout_policy
+
+    assert _request_timeout_policy("initialize", 1800) == (30.0, 30.0)
+    assert _request_timeout_policy("session/new", 1800) == (30.0, 30.0)
+    assert _request_timeout_policy("session/prompt", 1800) == (1800.0, 300.0)
+    assert _request_timeout_policy("session/prompt", 120) == (120.0, 120.0)
+
+
+def test_prompt_activity_resets_idle_timeout_without_extending_absolute_cap(tmp_path, monkeypatch):
+    from agent import copilot_acp_client
+
+    original_policy = copilot_acp_client._request_timeout_policy
+
+    def short_idle(method, timeout_seconds):
+        if method == "session/prompt":
+            return 1.0, 0.1
+        return original_policy(method, timeout_seconds)
+
+    monkeypatch.setattr(copilot_acp_client, "_request_timeout_policy", short_idle)
+    client, _log = _client(tmp_path, "active_slow_prompt")
+
+    response = client.chat.completions.create(
+        model="claude-opus-5",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=1.0,
+    )
+
+    assert response.choices[0].message.content == "HERMES_CLAUDE_ACP_OK"
+
+
+@pytest.mark.parametrize(
+    "message,expected_reason",
+    [
+        (
+            "Claude Agent ACP actual-model telemetry was missing from the raw SDK events.",
+            "model_not_found",
+        ),
+        (
+            "Claude Agent ACP requested 'claude-sonnet-5' but the SDK answered with 'claude-opus-5'.",
+            "model_not_found",
+        ),
+        (
+            "Claude Agent ACP provider telemetry was missing for the actual answering model.",
+            "model_not_found",
+        ),
+        (
+            "Claude Agent ACP reported serving provider 'bedrock'. Only firstParty is allowed.",
+            "model_not_found",
+        ),
+    ],
+)
+def test_integrity_failures_are_non_retryable_and_fallback_worthy(message, expected_reason):
+    from agent.error_classifier import classify_api_error
+
+    result = classify_api_error(
+        RuntimeError(message),
+        provider="claude-acp",
+        model="claude-sonnet-5",
+    )
+
+    assert result.reason.value == expected_reason
+    assert result.retryable is False
+    assert result.should_fallback is True
+
+
+def test_claude_acp_timeout_falls_back_without_a_second_long_wait():
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    result = classify_api_error(
+        TimeoutError("Timed out waiting for Claude Agent ACP response to session/prompt."),
+        provider="claude-acp",
+        model="claude-opus-5",
+    )
+
+    assert result.reason == FailoverReason.timeout
+    assert result.retryable is False
+    assert result.should_fallback is True
+
+
+def test_claude_acp_process_exit_gets_one_fast_retry():
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    result = classify_api_error(
+        RuntimeError("Claude Agent ACP process exited before responding to session/new."),
+        provider="claude-acp",
+        model="claude-opus-5",
+    )
+
+    assert result.reason == FailoverReason.timeout
+    assert result.retryable is True
+    assert result.should_fallback is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Claude Agent ACP session/new failed: Not logged in. Run /login.",
+        "Claude Agent ACP process exited early: Claude authentication has expired.",
+        "Claude Agent ACP process exited early: Login required before starting a session.",
+        "Claude Agent ACP refused to start because ANTHROPIC_API_KEY is set.",
+    ],
+)
+def test_claude_acp_login_failures_fall_back_without_retry(message):
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    result = classify_api_error(
+        RuntimeError(message),
+        provider="claude-acp",
+        model="claude-opus-5",
+    )
+
+    assert result.reason == FailoverReason.auth_permanent
+    assert result.retryable is False
+    assert result.should_fallback is True
 
 
 def test_cancellation_terminates_and_reaps_process(tmp_path, monkeypatch):
