@@ -341,17 +341,64 @@ def _format_messages_as_prompt(
 
         content = message.get("content")
         rendered = _render_message_content(content)
-        if not rendered:
-            continue
+        if rendered:
+            if role == "tool":
+                tool_call_id = str(message.get("tool_call_id") or "unknown")
+                tool_name = str(message.get("name") or "unknown")
+                transcript.append(
+                    f"Tool result ({tool_call_id}, {tool_name}):\n{rendered}"
+                )
+            else:
+                label = {
+                    "system": "System",
+                    "user": "User",
+                    "assistant": "Assistant",
+                    "context": "Context",
+                }.get(role, role.title())
+                transcript.append(f"{label}:\n{rendered}")
 
-        label = {
-            "system": "System",
-            "user": "User",
-            "assistant": "Assistant",
-            "tool": "Tool",
-            "context": "Context",
-        }.get(role, role.title())
-        transcript.append(f"{label}:\n{rendered}")
+        tool_calls = message.get("tool_calls") or []
+        if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+            normalized_calls: list[dict[str, Any]] = []
+            for call in tool_calls:
+                if isinstance(call, dict):
+                    function = call.get("function") or {}
+                    normalized_calls.append(
+                        {
+                            "id": str(call.get("id") or ""),
+                            "type": str(call.get("type") or "function"),
+                            "function": {
+                                "name": str(
+                                    function.get("name", "")
+                                    if isinstance(function, dict)
+                                    else getattr(function, "name", "")
+                                ),
+                                "arguments": str(
+                                    function.get("arguments", "{}")
+                                    if isinstance(function, dict)
+                                    else getattr(function, "arguments", "{}")
+                                ),
+                            },
+                        }
+                    )
+                else:
+                    function = getattr(call, "function", None)
+                    normalized_calls.append(
+                        {
+                            "id": str(getattr(call, "id", "") or ""),
+                            "type": str(getattr(call, "type", "function") or "function"),
+                            "function": {
+                                "name": str(getattr(function, "name", "") or ""),
+                                "arguments": str(
+                                    getattr(function, "arguments", "{}") or "{}"
+                                ),
+                            },
+                        }
+                    )
+            transcript.append(
+                "Assistant tool calls:\n"
+                + json.dumps(normalized_calls, ensure_ascii=False)
+            )
 
     if transcript:
         sections.append("Conversation transcript:\n\n" + "\n\n".join(transcript))
@@ -402,7 +449,10 @@ class _ACPChatCompletions:
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
-        return self._client._create_chat_completion(**kwargs)
+        # One persistent ACP process has one JSON-RPC inbox. Serializing calls
+        # prevents concurrent gateway turns from consuming each other's replies.
+        with self._client._acp_request_lock:
+            return self._client._create_chat_completion(**kwargs)
 
 
 class _ACPChatNamespace:
@@ -442,11 +492,18 @@ class CopilotACPClient:
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
+        self._acp_request_lock = threading.Lock()
         self.last_advertised_models: list[str] = []
         self.last_confirmed_model: str = ""
         self.last_picker_confirmed_model: str = ""
         self.last_picker_selector: str = ""
         self.last_actual_model: str = ""
+        self._reuse_acp_session = False
+        self._persistent_acp_request: Any = None
+        self._persistent_acp_session_id = ""
+        self._persistent_acp_model_state: dict[str, Any] | None = None
+        self._persistent_acp_advertised_models: list[str] = []
+        self._persistent_acp_requested_model = ""
 
     @property
     def _provider_label(self) -> str:
@@ -498,6 +555,12 @@ class CopilotACPClient:
     ) -> None:
         del actual_model, model_state
 
+    def _matching_response_usage(
+        self, actual_model: str, model_state: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        del actual_model, model_state
+        return None
+
     def _command_start_error(self) -> str:
         return (
             f"Could not start Copilot ACP command '{self._acp_command}'. "
@@ -507,6 +570,11 @@ class CopilotACPClient:
 
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
+        self._persistent_acp_request = None
+        self._persistent_acp_session_id = ""
+        self._persistent_acp_model_state = None
+        self._persistent_acp_advertised_models = []
+        self._persistent_acp_requested_model = ""
         with self._active_process_lock:
             proc = self._active_process
             self._active_process = None
@@ -534,7 +602,7 @@ class CopilotACPClient:
         stream: bool = False,
         **_: Any,
     ) -> Any:
-        prompt_text = _format_messages_as_prompt(
+        prompt_text = self._format_request_prompt(
             messages or [],
             model=model,
             tools=tools,
@@ -566,12 +634,7 @@ class CopilotACPClient:
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = self._completion_usage(result)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -589,6 +652,30 @@ class CopilotACPClient:
         if stream:
             return _completion_to_stream_chunks(completion)
         return completion
+
+    def _format_request_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+    ) -> str:
+        return _format_messages_as_prompt(
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
+    def _completion_usage(self, result: SimpleNamespace) -> SimpleNamespace:
+        del result
+        return SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
 
     def _execute_prompt(
         self,
@@ -658,6 +745,19 @@ class CopilotACPClient:
                 f"HERMES_COPILOT_ACP_COMMAND / HERMES_COPILOT_ACP_ARGS "
                 f"to a working pair."
             )
+        if prompt_text is not None and self._persistent_acp_request is not None:
+            proc = self._active_process
+            if (
+                self._reuse_acp_session
+                and proc is not None
+                and proc.poll() is None
+                and requested_model == self._persistent_acp_requested_model
+            ):
+                return self._continue_persistent_acp_session(
+                    prompt_text=prompt_text,
+                    requested_model=requested_model,
+                )
+            self.close()
 
         try:
             # Hide the console the CLI child would otherwise flash on Windows
@@ -808,6 +908,7 @@ class CopilotACPClient:
                 f"Timed out waiting for {self._provider_label} response to {method}."
             )
 
+        keep_open = False
         try:
             _request(
                 "initialize",
@@ -949,14 +1050,75 @@ class CopilotACPClient:
             self._validate_answering_model(requested_model, actual_model)
             self._validate_serving_provider(actual_model, model_state)
             self.last_confirmed_model = confirmed_model
+            if self._reuse_acp_session:
+                self._persistent_acp_request = _request
+                self._persistent_acp_session_id = session_id
+                self._persistent_acp_model_state = model_state
+                self._persistent_acp_advertised_models = list(advertised_models)
+                self._persistent_acp_requested_model = str(requested_model or "")
+                keep_open = True
             return SimpleNamespace(
                 text="".join(text_parts),
                 reasoning="".join(reasoning_parts),
                 advertised_models=advertised_models,
                 confirmed_model=confirmed_model,
+                model_usage=self._matching_response_usage(actual_model, model_state),
             )
         finally:
+            if not keep_open:
+                self.close()
+
+    def _continue_persistent_acp_session(
+        self,
+        *,
+        prompt_text: str,
+        requested_model: str | None,
+    ) -> SimpleNamespace:
+        request = self._persistent_acp_request
+        model_state = self._persistent_acp_model_state
+        session_id = self._persistent_acp_session_id
+        if request is None or model_state is None or not session_id:
+            raise RuntimeError(f"{self._provider_label} persistent session is unavailable.")
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        model_state.pop("actual_model", None)
+        model_state.pop("model_usage", None)
+        try:
+            request(
+                "session/prompt",
+                {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": prompt_text}],
+                },
+                text_parts=text_parts,
+                reasoning_parts=reasoning_parts,
+                model_state=model_state,
+            )
+            picker_confirmed_model = str(
+                model_state.get("confirmed_model") or ""
+            ).strip()
+            actual_model = str(model_state.get("actual_model") or "").strip()
+            stable_actual_model = self._stable_answering_model(actual_model)
+            confirmed_model = stable_actual_model or picker_confirmed_model
+            self.last_picker_confirmed_model = picker_confirmed_model
+            self.last_picker_selector = str(
+                model_state.get("confirmed_selector") or ""
+            ).strip()
+            self.last_actual_model = actual_model
+            self._validate_answering_model(requested_model, actual_model)
+            self._validate_serving_provider(actual_model, model_state)
+            self.last_confirmed_model = confirmed_model
+            return SimpleNamespace(
+                text="".join(text_parts),
+                reasoning="".join(reasoning_parts),
+                advertised_models=list(self._persistent_acp_advertised_models),
+                confirmed_model=confirmed_model,
+                model_usage=self._matching_response_usage(actual_model, model_state),
+            )
+        except Exception:
             self.close()
+            raise
 
     def _handle_server_message(
         self,
