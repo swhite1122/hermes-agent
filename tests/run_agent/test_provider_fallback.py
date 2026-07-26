@@ -106,6 +106,79 @@ class TestFallbackChainAdvancement:
 
         assert agent._rate_limited_until == 100.0 + 900.0
 
+    def test_claude_acp_session_limit_uses_reported_reset_cooldown(self):
+        fbs = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "claude-acp"
+        agent.model = "claude-opus-5"
+        agent._primary_runtime = {"provider": "claude-acp"}
+        agent._rate_limited_until = 0
+
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=300.0),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-5.6-sol"),
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                FailoverReason.session_limit,
+                retry_after_seconds=5400.0,
+            ) is True
+
+        assert agent._rate_limited_until == 300.0 + 5400.0
+
+    def test_fallback_closes_replaced_claude_acp_process(self):
+        fbs = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
+        agent = _make_agent(fallback_model=fbs)
+        old_client = MagicMock()
+        agent.client = old_client
+        agent.provider = "claude-acp"
+        agent.model = "claude-opus-5"
+        agent._primary_runtime = {"provider": "claude-acp"}
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-5.6-sol"),
+        ):
+            assert agent._try_activate_fallback(FailoverReason.turn_budget) is True
+
+        old_client.close.assert_called_once_with()
+
+    def test_request_factory_reuses_shared_claude_acp_client(self):
+        agent = _make_agent()
+        class SharedACPClient:
+            def __init__(self):
+                self.close = MagicMock()
+
+        shared_client = SharedACPClient()
+        agent.client = shared_client
+        agent.provider = "claude-acp"
+        agent.model = "claude-opus-5"
+
+        with (
+            patch.object(
+                agent,
+                "_ensure_primary_openai_client",
+                return_value=shared_client,
+            ),
+            patch.object(agent, "_create_openai_client") as create_client,
+        ):
+            request_client = agent._create_request_openai_client(
+                reason="test", api_kwargs={"messages": []}
+            )
+
+        assert request_client is shared_client
+        create_client.assert_not_called()
+
+        agent._close_request_openai_client(
+            request_client, reason="request_complete"
+        )
+        shared_client.close.assert_not_called()
+
+        agent._abort_request_openai_client(request_client, reason="interrupt")
+        shared_client.close.assert_called_once_with()
+
     def test_claude_acp_failure_arms_cooldown_even_when_fallback_resolution_fails(self):
         fbs = [{"provider": "openai-codex", "model": "gpt-5.6-sol"}]
         agent = _make_agent(fallback_model=fbs)
