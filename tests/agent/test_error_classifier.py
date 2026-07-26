@@ -53,7 +53,7 @@ class TestFailoverReason:
 
     def test_enum_members_exist(self):
         expected = {
-            "auth", "auth_permanent", "billing", "rate_limit",
+            "auth", "auth_permanent", "billing", "rate_limit", "session_limit",
             "upstream_rate_limit",
             "overloaded", "server_error", "timeout",
             "ssl_cert_verification",
@@ -63,7 +63,7 @@ class TestFailoverReason:
             "multimodal_tool_content_unsupported",
             "provider_policy_blocked",
             "content_policy_blocked",
-            "thinking_signature", "long_context_tier",
+            "thinking_signature", "long_context_tier", "turn_budget",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
             "unknown",
