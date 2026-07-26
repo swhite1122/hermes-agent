@@ -5504,7 +5504,12 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if agent._try_activate_fallback(
+                            reason=classified.reason,
+                            retry_after_seconds=(classified.error_context or {}).get(
+                                "retry_after_seconds"
+                            ),
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -5538,7 +5543,12 @@ def run_conversation(
                         "🔐 Authentication failed and could not be refreshed — "
                         "switching to fallback provider..."
                     )
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if agent._try_activate_fallback(
+                            reason=classified.reason,
+                            retry_after_seconds=(classified.error_context or {}).get(
+                                "retry_after_seconds"
+                            ),
+                        ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6149,9 +6159,22 @@ def run_conversation(
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
+                        elif classified.reason == FailoverReason.turn_budget:
+                            agent._buffer_status(
+                                "⚠️ Claude per-turn safety budget reached — continuing with fallback provider..."
+                            )
+                        elif classified.reason == FailoverReason.session_limit:
+                            agent._buffer_status(
+                                "⚠️ Claude subscription session limit reached — continuing with fallback provider..."
+                            )
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if agent._try_activate_fallback(
+                            reason=classified.reason,
+                            retry_after_seconds=(classified.error_context or {}).get(
+                                "retry_after_seconds"
+                            ),
+                        ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6365,7 +6388,12 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    if agent._try_activate_fallback(
+                            reason=classified.reason,
+                            retry_after_seconds=(classified.error_context or {}).get(
+                                "retry_after_seconds"
+                            ),
+                        ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0

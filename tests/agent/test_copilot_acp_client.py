@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import CopilotACPClient, _format_messages_as_prompt
 
 
 class _FakeProcess:
@@ -23,6 +23,38 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.client = CopilotACPClient(acp_cwd="/tmp")
 
 
+    def test_prompt_preserves_assistant_tool_calls_before_tool_results(self) -> None:
+        prompt = _format_messages_as_prompt(
+            [
+                {"role": "user", "content": "Inspect the config"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_cfg",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"config.yaml"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_cfg",
+                    "name": "read_file",
+                    "content": "setting: true",
+                },
+            ]
+        )
+
+        call_marker = 'Assistant tool calls:\n[{"id": "call_cfg"'
+        result_marker = "Tool result (call_cfg, read_file):\nsetting: true"
+        self.assertIn(call_marker, prompt)
+        self.assertIn(result_marker, prompt)
+        self.assertLess(prompt.index(call_marker), prompt.index(result_marker))
 
     def test_stream_true_preserves_tool_call_deltas(self) -> None:
         tool_response = (
@@ -195,6 +227,7 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
     real_home = tmp_path / "real-home"
     real_home.mkdir()
 
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
     monkeypatch.setenv("HOME", str(real_home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     # Hermeticity: an ambient HERMES_REAL_HOME (exported by Hermes' own
@@ -226,6 +259,7 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
 def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
 
     captured = {}
     client = _make_home_client(tmp_path)
