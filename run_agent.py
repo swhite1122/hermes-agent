@@ -4538,7 +4538,7 @@ class AIAgent:
         from unittest.mock import Mock
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
-        if self.provider == "moa":
+        if self.provider in {"claude-acp", "copilot-acp", "moa"}:
             return primary_client
         if isinstance(primary_client, Mock):
             return primary_client
@@ -4563,6 +4563,16 @@ class AIAgent:
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        if (
+            self.provider in {"claude-acp", "copilot-acp"}
+            and client is getattr(self, "client", None)
+            and reason in {"request_complete", "stream_request_complete"}
+        ):
+            logger.debug(
+                "ACP request complete; preserving shared in-memory session (%s)",
+                reason,
+            )
+            return
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
@@ -4580,6 +4590,15 @@ class AIAgent:
         — which is where the FD release belongs.
         """
         if client is None:
+            return
+        if (
+            self.provider in {"claude-acp", "copilot-acp"}
+            and client is getattr(self, "client", None)
+        ):
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                close_fn()
+            logger.info("ACP shared client aborted (%s)", reason)
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
@@ -5583,10 +5602,17 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(
+        self,
+        reason: "FailoverReason | None" = None,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(
+            self, reason, retry_after_seconds=retry_after_seconds
+        )
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.

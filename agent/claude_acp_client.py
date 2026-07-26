@@ -10,12 +10,22 @@ from __future__ import annotations
 
 import os
 import re
+import copy
+import hashlib
+import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent.copilot_acp_client import CopilotACPClient, _resolve_home_dir
+from agent.copilot_acp_client import (
+    CopilotACPClient,
+    _format_messages_as_prompt,
+    _resolve_home_dir,
+)
 from tools.environments.local import hermes_subprocess_env
+
+logger = logging.getLogger(__name__)
 
 CLAUDE_ACP_MARKER_BASE_URL = "acp://claude"
 DEFAULT_CLAUDE_ACP_COMMAND = "claude-agent-acp"
@@ -137,6 +147,118 @@ class ClaudeACPClient(CopilotACPClient):
         self.last_raw_advertised_models: list[str] = []
         self.last_model_metadata: dict[str, dict[str, Any]] = {}
         self.last_serving_provider: str = ""
+        self._reuse_acp_session = True
+        self._last_hermes_messages: list[dict[str, Any]] = []
+        self._last_tools_fingerprint = ""
+        self._last_request_model = ""
+        self._turn_anchor = ""
+        self._turn_call_count = 0
+
+    def close(self) -> None:
+        super().close()
+        self._last_hermes_messages = []
+        self._last_tools_fingerprint = ""
+        self._last_request_model = ""
+
+    @staticmethod
+    def _latest_user_anchor(messages: list[dict[str, Any]]) -> str:
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, dict) and message.get("role") == "user":
+                payload = json.dumps(message, sort_keys=True, default=str)
+                digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                return f"{index}:{digest}"
+        return "no-user"
+
+    def _enforce_turn_call_budget(self, messages: list[dict[str, Any]]) -> None:
+        try:
+            limit = int(os.getenv("HERMES_CLAUDE_ACP_MAX_CALLS_PER_TURN", "24"))
+        except (TypeError, ValueError):
+            limit = 24
+        limit = max(1, min(250, limit))
+        anchor = self._latest_user_anchor(messages)
+        if anchor != self._turn_anchor:
+            self._turn_anchor = anchor
+            self._turn_call_count = 0
+        if self._turn_call_count >= limit:
+            raise RuntimeError(
+                "Claude Agent ACP per-turn call budget exhausted "
+                f"({limit} calls). Switching providers protects the Claude "
+                "subscription window; the budget resets on the next user message."
+            )
+        self._turn_call_count += 1
+        logger.info(
+            "Claude ACP turn budget call=%d limit=%d anchor=%s",
+            self._turn_call_count,
+            limit,
+            anchor[:16],
+        )
+
+    def _create_chat_completion(self, **kwargs: Any) -> Any:
+        messages = kwargs.get("messages") or []
+        if not isinstance(messages, list):
+            messages = []
+        self._enforce_turn_call_budget(messages)
+        snapshot = copy.deepcopy(messages)
+        tools_fingerprint = json.dumps(
+            kwargs.get("tools") or [], sort_keys=True, default=str
+        )
+        request_model = str(kwargs.get("model") or "")
+        try:
+            result = super()._create_chat_completion(**kwargs)
+        except Exception:
+            raise
+        if self._persistent_acp_request is not None:
+            self._last_hermes_messages = snapshot
+            self._last_tools_fingerprint = tools_fingerprint
+            self._last_request_model = request_model
+        return result
+
+    def _format_request_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+    ) -> str:
+        tools_fingerprint = json.dumps(tools or [], sort_keys=True, default=str)
+        previous = self._last_hermes_messages
+        can_append = (
+            self._persistent_acp_request is not None
+            and str(model or "") == self._last_request_model
+            and tools_fingerprint == self._last_tools_fingerprint
+            and len(messages) >= len(previous)
+            and messages[: len(previous)] == previous
+        )
+        if can_append:
+            appended = [
+                message
+                for message in messages[len(previous) :]
+                if isinstance(message, dict) and message.get("role") != "assistant"
+            ]
+            if appended:
+                logger.info(
+                    "Claude ACP prompt mode=delta appended_messages=%d "
+                    "skipped_assistant_messages=%d",
+                    len(appended),
+                    len(messages[len(previous) :]) - len(appended),
+                )
+                return _format_messages_as_prompt(appended)
+
+        if self._persistent_acp_request is not None:
+            self.close()
+        logger.info(
+            "Claude ACP prompt mode=full messages=%d tools=%d",
+            len(messages),
+            len(tools or []),
+        )
+        return super()._format_request_prompt(
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
     @property
     def _provider_label(self) -> str:
@@ -358,6 +480,57 @@ class ClaudeACPClient(CopilotACPClient):
                 CLAUDE_ACP_MARKER_BASE_URL,
                 context_window,
             )
+
+    def _matching_response_usage(
+        self, actual_model: str, model_state: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return self._matching_model_usage(
+            actual_model, model_state.get("model_usage")
+        )
+
+    def _completion_usage(self, result: SimpleNamespace) -> SimpleNamespace:
+        raw = getattr(result, "model_usage", None) or {}
+
+        def _number(*names: str) -> int:
+            for name in names:
+                value = raw.get(name)
+                if isinstance(value, (int, float)) and value >= 0:
+                    return int(value)
+            return 0
+
+        cache_read = _number("cacheReadInputTokens", "cache_read_input_tokens")
+        cache_creation = _number(
+            "cacheCreationInputTokens", "cache_creation_input_tokens"
+        )
+        prompt = (
+            _number("inputTokens", "input_tokens") + cache_read + cache_creation
+        )
+        output = _number("outputTokens", "output_tokens")
+        try:
+            cost_usd = float(raw.get("costUSD", raw.get("cost_usd", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            cost_usd = 0.0
+        logger.info(
+            "Claude ACP usage prompt_tokens=%d output_tokens=%d "
+            "cache_read_tokens=%d cache_creation_tokens=%d cost_usd=%.6f",
+            prompt,
+            output,
+            cache_read,
+            cache_creation,
+            cost_usd,
+        )
+        return SimpleNamespace(
+            prompt_tokens=prompt,
+            completion_tokens=output,
+            total_tokens=prompt + output,
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=cache_read,
+                cache_write_tokens=cache_creation,
+            ),
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_creation,
+            cost_usd=cost_usd,
+        )
 
     def discover_models(self, *, timeout_seconds: float = 30.0) -> list[str]:
         """Return exact model ids advertised by the ACP session model selector."""

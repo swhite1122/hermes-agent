@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -89,7 +90,15 @@ for line in sys.stdin:
         if mode != "missing_actual_model":
             emit({"jsonrpc": "2.0", "method": "_claude/sdkMessage", "params": {"sessionId": "session-1", "message": {"type": "assistant", "message": {"model": actual}}}})
         emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "HERMES_CLAUDE_ACP_OK"}}}})
-        usage = {"canonicalModel": actual, "contextWindow": 1000000}
+        usage = {
+            "canonicalModel": actual,
+            "contextWindow": 1000000,
+            "inputTokens": 11,
+            "outputTokens": 7,
+            "cacheReadInputTokens": 5,
+            "cacheCreationInputTokens": 3,
+            "costUSD": 0.25,
+        }
         if mode != "missing_provider":
             usage["provider"] = "bedrock" if mode == "non_first_party" else "firstParty"
         emit({"jsonrpc": "2.0", "method": "_claude/sdkMessage", "params": {"sessionId": "session-1", "message": {"type": "result", "modelUsage": {current: usage}}}})
@@ -374,6 +383,243 @@ def test_exact_selected_model_is_sent_before_prompt(tmp_path, monkeypatch):
     assert client.last_picker_confirmed_model == "claude-sonnet-5"
     assert client.last_actual_model == "claude-sonnet-5"
     assert client.last_serving_provider == "firstParty"
+
+
+def test_model_usage_is_mapped_to_openai_usage(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client, _ = _client(tmp_path)
+    try:
+        response = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hello"}],
+            timeout=2,
+        )
+    finally:
+        client.close()
+
+    assert response.usage.prompt_tokens == 19
+    assert response.usage.completion_tokens == 7
+    assert response.usage.total_tokens == 26
+    assert response.usage.prompt_tokens_details.cached_tokens == 5
+    assert response.usage.prompt_tokens_details.cache_write_tokens == 3
+    assert response.usage.cache_creation_input_tokens == 3
+    assert response.usage.cost_usd == pytest.approx(0.25)
+
+    from agent.usage_pricing import normalize_usage
+
+    canonical = normalize_usage(
+        response.usage,
+        provider="claude-acp",
+        api_mode="chat_completions",
+    )
+    assert canonical.input_tokens == 11
+    assert canonical.cache_read_tokens == 5
+    assert canonical.cache_write_tokens == 3
+    assert canonical.output_tokens == 7
+
+
+def test_reuses_in_memory_session_and_sends_only_appended_context(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client, log = _client(tmp_path)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    first_messages = [{"role": "user", "content": "inspect UNIQUE_ORIGINAL"}]
+    second_messages = first_messages + [
+        {"role": "assistant", "content": "HERMES_CLAUDE_ACP_OK"},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "read_file",
+            "content": "UNIQUE_TOOL_RESULT",
+        },
+    ]
+
+    try:
+        client.chat.completions.create(
+            model="claude-opus-5",
+            messages=first_messages,
+            tools=tools,
+            timeout=2,
+        )
+        client.chat.completions.create(
+            model="claude-opus-5",
+            messages=second_messages,
+            tools=tools,
+            timeout=2,
+        )
+        requests = _requests(log)
+    finally:
+        client.close()
+
+    assert len({item["pid"] for item in requests}) == 1
+    assert [item["method"] for item in requests].count("initialize") == 1
+    assert [item["method"] for item in requests].count("session/new") == 1
+    prompts = [
+        item["params"]["prompt"][0]["text"]
+        for item in requests
+        if item["method"] == "session/prompt"
+    ]
+    assert len(prompts) == 2
+    assert "UNIQUE_ORIGINAL" in prompts[0]
+    assert "Available tools" in prompts[0]
+    assert "UNIQUE_TOOL_RESULT" in prompts[1]
+    assert "UNIQUE_ORIGINAL" not in prompts[1]
+    assert "Available tools" not in prompts[1]
+
+
+def test_rewritten_history_restarts_in_memory_session(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client, log = _client(tmp_path)
+    try:
+        client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "original history"}],
+            timeout=2,
+        )
+        client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[
+                {"role": "system", "content": "compressed summary"},
+                {"role": "user", "content": "continue after compression"},
+            ],
+            timeout=2,
+        )
+        requests = _requests(log)
+    finally:
+        client.close()
+
+    assert len({item["pid"] for item in requests}) == 2
+    assert [item["method"] for item in requests].count("initialize") == 2
+    assert [item["method"] for item in requests].count("session/new") == 2
+    prompts = [
+        item["params"]["prompt"][0]["text"]
+        for item in requests
+        if item["method"] == "session/prompt"
+    ]
+    assert "compressed summary" in prompts[1]
+    assert "original history" not in prompts[1]
+
+
+def test_persistent_acp_requests_are_serialized(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client, _ = _client(tmp_path)
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_completion(**kwargs):
+        nonlocal active, max_active
+        del kwargs
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+        return "ok"
+
+    monkeypatch.setattr(client, "_create_chat_completion", fake_completion)
+    threads = [
+        threading.Thread(target=client.chat.completions.create, kwargs={})
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert max_active == 1
+
+
+def test_per_turn_call_budget_falls_back_but_resets_for_next_user_turn(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_CLAUDE_ACP_MAX_CALLS_PER_TURN", "2")
+    client, log = _client(tmp_path)
+    messages = [{"role": "user", "content": "first user turn"}]
+
+    try:
+        client.chat.completions.create(
+            model="claude-opus-5", messages=messages, timeout=2
+        )
+        messages = messages + [
+            {"role": "assistant", "content": "HERMES_CLAUDE_ACP_OK"},
+            {"role": "tool", "content": "tool result one"},
+        ]
+        client.chat.completions.create(
+            model="claude-opus-5", messages=messages, timeout=2
+        )
+        messages = messages + [
+            {"role": "assistant", "content": "HERMES_CLAUDE_ACP_OK"},
+            {"role": "tool", "content": "tool result two"},
+        ]
+        with pytest.raises(RuntimeError, match="per-turn call budget exhausted"):
+            client.chat.completions.create(
+                model="claude-opus-5", messages=messages, timeout=2
+            )
+
+        next_turn = messages + [
+            {"role": "user", "content": "second user turn"}
+        ]
+        client.chat.completions.create(
+            model="claude-opus-5", messages=next_turn, timeout=2
+        )
+        prompt_count = [item["method"] for item in _requests(log)].count(
+            "session/prompt"
+        )
+    finally:
+        client.close()
+
+    assert prompt_count == 3
+
+
+def test_claude_acp_session_limit_is_non_retryable_and_fallback_worthy():
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 25, 15, 55, tzinfo=tz)
+
+    with patch("agent.error_classifier.datetime", FixedDatetime):
+        result = classify_api_error(
+            RuntimeError(
+                "You've hit your session limit · resets 6pm (America/New_York)"
+            ),
+            provider="claude-acp",
+            model="claude-opus-5",
+        )
+
+    assert result.reason == FailoverReason.session_limit
+    assert result.retryable is False
+    assert result.should_fallback is True
+    assert result.error_context["retry_after_seconds"] == pytest.approx(7500.0)
+
+
+def test_claude_acp_local_turn_budget_is_non_retryable_without_rate_cooldown():
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    result = classify_api_error(
+        RuntimeError(
+            "Claude Agent ACP per-turn call budget exhausted (24 calls)."
+        ),
+        provider="claude-acp",
+        model="claude-opus-5",
+    )
+
+    assert result.reason == FailoverReason.turn_budget
+    assert result.retryable is False
+    assert result.should_fallback is True
+    assert "retry_after_seconds" not in result.error_context
 
 
 def test_unavailable_model_fails_without_prompt_or_fallback(tmp_path, monkeypatch):
