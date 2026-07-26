@@ -70,6 +70,7 @@ _CLAUDE_ACP_COOLDOWN_REASONS = {
     FailoverReason.auth,
     FailoverReason.auth_permanent,
     FailoverReason.model_not_found,
+    FailoverReason.session_limit,
 }
 
 
@@ -2463,7 +2464,12 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    retry_after_seconds: float | None = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2496,7 +2502,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 time.monotonic() + _CLAUDE_ACP_FALLBACK_COOLDOWN_S,
             )
 
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    if reason in {
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+        FailoverReason.upstream_rate_limit,
+        FailoverReason.session_limit,
+    }:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -2504,19 +2515,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            # Exponential backoff: keep upstream's 60s first-hit cooldown and
-            # escalate on CONSECUTIVE rate-limits: 60s → 2m → 4m → 8m → ... →
-            # 4h cap. The first 429 must NOT bench the primary for half an
-            # hour — fast primary restore is the common case; escalation only
-            # punishes providers that keep 429ing.
-            # Counter is reset by restore_primary_runtime on successful restore.
+            # Keep upstream's escalating cooldown for consecutive failures, but
+            # honor a provider-reported reset window when it is longer (for
+            # example, a Claude ACP subscription-session reset time).
             backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
             agent._rate_limit_backoff_count = backoff_count + 1
             backoff_seconds = min(60 * (2 ** backoff_count), 14400)
-            agent._rate_limited_until = time.monotonic() + backoff_seconds
+            try:
+                requested_cooldown = float(retry_after_seconds or 60.0)
+            except (TypeError, ValueError):
+                requested_cooldown = 60.0
+            requested_cooldown = max(60.0, min(86400.0, requested_cooldown))
+            cooldown_seconds = max(backoff_seconds, requested_cooldown)
+            existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
+            agent._rate_limited_until = max(
+                existing_cooldown,
+                time.monotonic() + cooldown_seconds,
+            )
             logging.info(
-                "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
-                backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
+                "Rate-limit backoff level %d: cooldown %.0f s (%.1f min, backoff#%d)",
+                backoff_count,
+                cooldown_seconds,
+                cooldown_seconds / 60,
+                backoff_count + 1,
             )
     if agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
@@ -2527,7 +2548,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # provider again.  Guards the cross-turn replay storm in #24996.
         if (
             len(agent._fallback_chain) > 0
-            and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
+            and reason not in {
+                FailoverReason.rate_limit,
+                FailoverReason.billing,
+                FailoverReason.upstream_rate_limit,
+                FailoverReason.session_limit,
+            }
         ):
             _existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
             agent._rate_limited_until = max(
@@ -2702,6 +2728,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
         old_provider = agent.provider
+        old_client = getattr(agent, "client", None)
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -2762,6 +2789,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
         _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+
+        # ACP clients own a long-lived child process. Once fallback resolution
+        # has succeeded, close the replaced ACP client before swapping runtimes
+        # so a capped/rate-limited turn cannot leak an authenticated child.
+        if old_provider in {"claude-acp", "copilot-acp"} and old_client is not fb_client:
+            close_old = getattr(old_client, "close", None)
+            if callable(close_old):
+                try:
+                    close_old()
+                except Exception:
+                    logger.debug(
+                        "Could not close replaced %s client during fallback",
+                        old_provider,
+                        exc_info=True,
+                    )
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
