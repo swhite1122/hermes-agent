@@ -77,6 +77,15 @@ class TestBillingTriggersClientErrorAbort:
             "credential-pool rotation and provider fallback have failed — see #31273."
         )
 
+    def test_subscription_session_limit_aborts_without_retry(self):
+        """Deterministic Claude subscription exhaustion must never retry."""
+        from agent.error_classifier import FailoverReason
+
+        assert self._mirror_is_client_error(
+            classified_retryable=False,
+            classified_reason=FailoverReason.session_limit,
+        )
+
     def test_rate_limit_still_retries(self):
         """Sanity check: rate_limit must still fall through to backoff retry."""
         from agent.error_classifier import FailoverReason
