@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -37,6 +40,7 @@ class FailoverReason(enum.Enum):
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
+    session_limit = "session_limit"        # Subscription window exhausted until provider reset
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
     upstream_rate_limit = "upstream_rate_limit"
@@ -72,6 +76,7 @@ class FailoverReason(enum.Enum):
     # Provider-specific
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
+    turn_budget = "turn_budget"                # Local per-user-turn provider call budget
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp json-schema-to-grammar rejects regex escapes in `pattern` / `format` — strip from tools and retry
 
@@ -256,6 +261,37 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "per minute",
     "per second",
 ]
+
+
+def _claude_session_reset_seconds(message: str) -> float:
+    """Parse Claude Code's `resets 6pm (America/New_York)` notice."""
+    match = re.search(
+        r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return 900.0
+    hour = int(match.group(1)) % 12
+    if match.group(3).lower() == "pm":
+        hour += 12
+    minute = int(match.group(2) or 0)
+    tz_name = match.group(4).strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        canonical_name = next(
+            (name for name in available_timezones() if name.lower() == tz_name.lower()),
+            "",
+        )
+        if not canonical_name:
+            return 900.0
+        tz = ZoneInfo(canonical_name)
+    now = datetime.now(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(60.0, min(86400.0, (target - now).total_seconds()))
 
 # Payload-too-large patterns detected from message text (no status_code attr).
 # Proxies and some backends embed the HTTP status in the error message.
@@ -942,6 +978,24 @@ def classify_api_error(
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
     if provider_lower == "claude-acp":
+        if "hit your session limit" in error_msg and "resets" in error_msg:
+            return _result(
+                FailoverReason.session_limit,
+                retryable=False,
+                should_rotate_credential=False,
+                should_fallback=True,
+                error_context={
+                    "retry_after_seconds": _claude_session_reset_seconds(error_msg)
+                },
+            )
+
+        if "claude agent acp per-turn call budget exhausted" in error_msg:
+            return _result(
+                FailoverReason.turn_budget,
+                retryable=False,
+                should_fallback=True,
+            )
+
         if any(
             pattern in error_msg
             for pattern in (
