@@ -436,6 +436,14 @@ class CopilotACPClient:
     def _build_subprocess_env(self) -> dict[str, str]:
         return _build_subprocess_env()
 
+    def _client_capabilities(self) -> dict[str, Any]:
+        return {
+            "fs": {
+                "readTextFile": True,
+                "writeTextFile": True,
+            }
+        }
+
     def _session_new_params(self) -> dict[str, Any]:
         return {
             "cwd": self._acp_cwd,
@@ -831,12 +839,7 @@ class CopilotACPClient:
                 "initialize",
                 {
                     "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {
-                            "readTextFile": True,
-                            "writeTextFile": True,
-                        }
-                    },
+                    "clientCapabilities": self._client_capabilities(),
                     "clientInfo": {
                         "name": "hermes-agent",
                         "title": "Hermes Agent",
@@ -1063,8 +1066,13 @@ class CopilotACPClient:
         message_id = msg.get("id")
         params = msg.get("params") or {}
 
+        fs_capabilities = self._client_capabilities().get("fs") or {}
         if method == "session/request_permission":
             response = _permission_denied(message_id)
+        elif method == "fs/read_text_file" and not fs_capabilities.get("readTextFile"):
+            response = _jsonrpc_error(message_id, -32601, "ACP filesystem access is disabled.")
+        elif method == "fs/write_text_file" and not fs_capabilities.get("writeTextFile"):
+            response = _jsonrpc_error(message_id, -32601, "ACP filesystem access is disabled.")
         elif method == "fs/read_text_file":
             try:
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
