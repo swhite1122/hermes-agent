@@ -60,6 +60,7 @@ _FAMILY_VERSION_RE = re.compile(
     re.IGNORECASE,
 )
 _APPROVED_MODELS = frozenset({"claude-opus-5", "claude-sonnet-5"})
+_CLAUDE_ACP_MAX_CALLS_PER_TURN = 24
 
 
 def _canonical_selector(option: dict[str, Any]) -> str:
@@ -171,11 +172,7 @@ class ClaudeACPClient(CopilotACPClient):
         return "no-user"
 
     def _enforce_turn_call_budget(self, messages: list[dict[str, Any]]) -> None:
-        try:
-            limit = int(os.getenv("HERMES_CLAUDE_ACP_MAX_CALLS_PER_TURN", "24"))
-        except (TypeError, ValueError):
-            limit = 24
-        limit = max(1, min(250, limit))
+        limit = _CLAUDE_ACP_MAX_CALLS_PER_TURN
         anchor = self._latest_user_anchor(messages)
         if anchor != self._turn_anchor:
             self._turn_anchor = anchor
@@ -292,6 +289,9 @@ class ClaudeACPClient(CopilotACPClient):
 
         apply_subprocess_home_env(env)
         return env
+
+    def _client_capabilities(self) -> dict[str, Any]:
+        return {}
 
     def _session_new_params(self) -> dict[str, Any]:
         return {
