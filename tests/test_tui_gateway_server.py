@@ -748,6 +748,10 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         server._start_agent_build(sid, session)
         assert built.wait(timeout=15), "agent build thread never called _make_agent"
         assert ready.wait(timeout=5), "agent_ready never set after build"
+        build_thread = session["_agent_build_thread"]
+        build_thread.join(timeout=10)
+        assert not build_thread.is_alive(), "agent build did not finish within 10 seconds"
+        assert built.is_set()
     finally:
         server._sessions.pop(sid, None)
 
@@ -810,6 +814,10 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
         server._start_agent_build(sid, session)
         assert built.wait(timeout=15), "agent build thread never called _make_agent"
         assert ready.wait(timeout=5), "agent_ready never set after build"
+        build_thread = session["_agent_build_thread"]
+        build_thread.join(timeout=10)
+        assert not build_thread.is_alive(), "agent build did not finish within 10 seconds"
+        assert built.is_set()
     finally:
         server._sessions.pop(sid, None)
 
