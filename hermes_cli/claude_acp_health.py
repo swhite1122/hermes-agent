@@ -119,44 +119,52 @@ def probe_claude_acp(
     if cwd is not None:
         client_kwargs["acp_cwd"] = str(Path(cwd).resolve())
 
+    client: ClaudeACPClient | None = None
     try:
-        client = ClaudeACPClient(**client_kwargs)
-        models = client.discover_models(timeout_seconds=30.0)
-    except Exception as exc:
-        result["error"] = _safe_error("Claude ACP model discovery failed", exc)
+        try:
+            active_client = ClaudeACPClient(**client_kwargs)
+            client = active_client
+            models = active_client.discover_models(timeout_seconds=30.0)
+        except Exception as exc:
+            result["error"] = _safe_error("Claude ACP model discovery failed", exc)
+            return result
+
+        result["models"] = list(models)
+        canaries: dict[str, bool] = {}
+        if run_canary:
+            for model in CLAUDE_ACP_CANARY_MODELS:
+                try:
+                    response = active_client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": f"Reply exactly {CLAUDE_ACP_CANARY_MARKER}",
+                            }
+                        ],
+                        timeout=120,
+                    )
+                    canaries[model] = (
+                        _message_content(response) == CLAUDE_ACP_CANARY_MARKER
+                    )
+                except Exception:
+                    canaries[model] = False
+            result["canaries"] = canaries
+
+        result["ok"] = bool(
+            result["installed"]
+            and result["logged_in"]
+            and result["adapter_version"] == CLAUDE_ACP_VERSION
+            and result["sdk_version"] == CLAUDE_SDK_VERSION
+            and result["models"]
+            and (not run_canary or all(canaries.values()))
+        )
+        if run_canary and not result["ok"] and not result["error"]:
+            result["error"] = "Claude ACP canary failed."
         return result
-
-    result["models"] = list(models)
-    canaries: dict[str, bool] = {}
-    if run_canary:
-        for model in CLAUDE_ACP_CANARY_MODELS:
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": f"Reply exactly {CLAUDE_ACP_CANARY_MARKER}",
-                        }
-                    ],
-                    timeout=120,
-                )
-                canaries[model] = _message_content(response) == CLAUDE_ACP_CANARY_MARKER
-            except Exception:
-                canaries[model] = False
-        result["canaries"] = canaries
-
-    result["ok"] = bool(
-        result["installed"]
-        and result["logged_in"]
-        and result["adapter_version"] == CLAUDE_ACP_VERSION
-        and result["sdk_version"] == CLAUDE_SDK_VERSION
-        and result["models"]
-        and (not run_canary or all(canaries.values()))
-    )
-    if run_canary and not result["ok"] and not result["error"]:
-        result["error"] = "Claude ACP canary failed."
-    return result
+    finally:
+        if client is not None:
+            client.close()
 
 
 def _print_human(result: dict[str, Any]) -> None:
