@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -9,6 +10,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -312,6 +314,41 @@ def test_model_config_discovery_exposes_only_approved_ids_and_keeps_raw_selector
     assert "claude-fable-5" not in client.last_model_metadata
 
 
+def test_initialize_does_not_advertise_acp_filesystem_capabilities(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    client, log = _client(tmp_path)
+    client.discover_models(timeout_seconds=2)
+
+    initialize = next(item for item in _requests(log) if item["method"] == "initialize")
+    assert "fs" not in initialize["params"]["clientCapabilities"]
+
+
+@pytest.mark.parametrize("method", ["fs/read_text_file", "fs/write_text_file"])
+def test_acp_filesystem_requests_fail_closed(tmp_path, method):
+    client, _ = _client(tmp_path)
+    target = tmp_path / "target.txt"
+    target.write_text("original", encoding="utf-8")
+    process = SimpleNamespace(stdin=io.StringIO())
+
+    handled = client._handle_server_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": method,
+            "params": {"path": str(target), "content": "changed"},
+        },
+        process=process,  # type: ignore[arg-type]
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+    )
+
+    response = json.loads(process.stdin.getvalue())
+    assert handled is True
+    assert response["error"]["code"] == -32601
+    assert target.read_text(encoding="utf-8") == "original"
+
+
 def test_fable_is_rejected_before_prompt(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     client, log = _client(tmp_path)
@@ -539,47 +576,17 @@ def test_persistent_acp_requests_are_serialized(tmp_path, monkeypatch):
     assert max_active == 1
 
 
-def test_per_turn_call_budget_falls_back_but_resets_for_next_user_turn(
-    tmp_path, monkeypatch
-):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv("HERMES_CLAUDE_ACP_MAX_CALLS_PER_TURN", "2")
-    client, log = _client(tmp_path)
+def test_per_turn_call_budget_is_fixed_and_resets_for_next_user_turn(tmp_path):
+    client, _ = _client(tmp_path)
     messages = [{"role": "user", "content": "first user turn"}]
 
-    try:
-        client.chat.completions.create(
-            model="claude-opus-5", messages=messages, timeout=2
-        )
-        messages = messages + [
-            {"role": "assistant", "content": "HERMES_CLAUDE_ACP_OK"},
-            {"role": "tool", "content": "tool result one"},
-        ]
-        client.chat.completions.create(
-            model="claude-opus-5", messages=messages, timeout=2
-        )
-        messages = messages + [
-            {"role": "assistant", "content": "HERMES_CLAUDE_ACP_OK"},
-            {"role": "tool", "content": "tool result two"},
-        ]
-        with pytest.raises(RuntimeError, match="per-turn call budget exhausted"):
-            client.chat.completions.create(
-                model="claude-opus-5", messages=messages, timeout=2
-            )
+    for _ in range(24):
+        client._enforce_turn_call_budget(messages)
+    with pytest.raises(RuntimeError, match=r"per-turn call budget exhausted \(24 calls\)"):
+        client._enforce_turn_call_budget(messages)
 
-        next_turn = messages + [
-            {"role": "user", "content": "second user turn"}
-        ]
-        client.chat.completions.create(
-            model="claude-opus-5", messages=next_turn, timeout=2
-        )
-        prompt_count = [item["method"] for item in _requests(log)].count(
-            "session/prompt"
-        )
-    finally:
-        client.close()
-
-    assert prompt_count == 3
+    next_turn = messages + [{"role": "user", "content": "second user turn"}]
+    client._enforce_turn_call_budget(next_turn)
 
 
 def test_claude_acp_session_limit_is_non_retryable_and_fallback_worthy():
