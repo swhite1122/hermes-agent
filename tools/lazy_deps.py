@@ -75,6 +75,7 @@ import site
 import subprocess
 import sys
 import sysconfig
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -216,12 +217,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # backbone. Pin the patched floor here too so the lazy Discord path
         # can't keep an already-installed vulnerable aiohttp satisfying that
         # range — mirrors the messaging extra and platform.slack.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273, GHSA-mfx4-hv73-q22v, GHSA-mq44-7p77-q5h7
     ),
     "platform.slack": (
         "slack-bolt==1.29.0",
         "slack-sdk==3.43.0",
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273, GHSA-mfx4-hv73-q22v, GHSA-mq44-7p77-q5h7
     ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.0",
@@ -231,7 +232,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # mautrix (aiohttp>=3,<4) and aiohttp-socks (aiohttp>=3.10.0) only cap
         # aiohttp transitively, so a vulnerable already-installed aiohttp still
         # satisfies both — pin the patched floor here too, like platform.discord.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273, GHSA-mfx4-hv73-q22v, GHSA-mq44-7p77-q5h7
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
@@ -250,7 +251,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
+    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
@@ -689,6 +690,37 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
+def _uv_project_overrides_file() -> Optional[Path]:
+    """Mirror trusted ``[tool.uv]`` overrides for ``uv pip install``.
+
+    The uv pip interface does not read project overrides automatically. Local
+    security overlays can therefore resolve in ``uv.lock`` but fail (or
+    downgrade a fixed package) during a later lazy install unless the same
+    overrides are passed explicitly.
+    """
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    try:
+        project_data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        overrides = project_data.get("tool", {}).get("uv", {}).get(
+            "override-dependencies", []
+        )
+        if not isinstance(overrides, list) or not all(
+            isinstance(item, str) and item.strip() for item in overrides
+        ):
+            raise ValueError("tool.uv.override-dependencies must be strings")
+        if not overrides:
+            return None
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="hermes-uv-overrides-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(overrides) + "\n")
+        return Path(path)
+    except Exception as e:
+        logger.debug("Could not build uv project overrides file: %s", e)
+        return None
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -710,6 +742,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
     target = _lazy_install_target()
     constraints: Optional[Path] = None
+    overrides = _uv_project_overrides_file()
 
     if target is not None:
         err = _ensure_target_ready(target)
@@ -724,6 +757,9 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     constraint_args: list[str] = []
     if constraints is not None:
         constraint_args = ["--constraint", str(constraints)]
+    override_args: list[str] = []
+    if overrides is not None:
+        override_args = ["--overrides", str(overrides)]
 
     try:
         venv_root = Path(sys.executable).parent.parent
@@ -747,7 +783,15 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         if uv_bin:
             try:
                 r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
+                    [
+                        uv_bin,
+                        "pip",
+                        "install",
+                        *target_args,
+                        *constraint_args,
+                        *override_args,
+                        *specs,
+                    ],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
@@ -759,6 +803,14 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 logger.debug("uv pip install failed: %s", r.stderr)
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 logger.debug("uv invocation failed: %s", e)
+
+        if overrides is not None:
+            return _InstallResult(
+                False,
+                "",
+                "uv failed while project dependency overrides were required; "
+                "refusing a plain-pip fallback that could downgrade core packages",
+            )
 
         # Tier 2: python -m pip (with ensurepip bootstrap if needed)
         pip_cmd = [sys.executable, "-m", "pip"]
@@ -801,6 +853,11 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         if constraints is not None:
             try:
                 constraints.unlink()
+            except OSError:
+                pass
+        if overrides is not None:
+            try:
+                overrides.unlink()
             except OSError:
                 pass
 
