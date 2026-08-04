@@ -21,6 +21,7 @@ import site
 import subprocess
 import sys
 import sysconfig
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -556,6 +557,23 @@ def _after_successful_install(specs: tuple[str, ...], target: Optional[Path], dr
     _warm_installed_bytecode(specs, target)
 
 
+def _uv_project_overrides_file() -> Optional[Path]:
+    """Mirror trusted project overrides for uv pip (not auto-consumed by uv)."""
+    import tempfile
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    project_data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    overrides = project_data.get("tool", {}).get("uv", {}).get("override-dependencies", [])
+    if not isinstance(overrides, list) or not all(isinstance(item, str) and item.strip() for item in overrides):
+        raise ValueError("tool.uv.override-dependencies must be strings")
+    if not overrides:
+        return None
+    fd, path = tempfile.mkstemp(prefix="hermes-uv-overrides-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(overrides) + "\n")
+    return Path(path)
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_lines: tuple[str, ...] = (),
                       dry_run: bool = False) -> _InstallResult:
     """Install ``specs`` via the uv -> pip -> ensurepip ladder, venv-scoped or into the durable
@@ -584,6 +602,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_
             _after_successful_install(specs, target, dry_run)
         return _InstallResult(r.returncode == 0, r.stdout or "", r.stderr or "")
 
+    overrides = _uv_project_overrides_file()
+    override_args = ["--overrides", str(overrides)] if overrides is not None else []
     try:
         from tools.environments.local import hermes_subprocess_env
         uv_env = hermes_subprocess_env(inherit_credentials=False)
@@ -599,7 +619,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_
                 if pip_index_url:
                     uv_env["UV_INDEX_URL"] = pip_index_url
             try:
-                r = _run_installer([uv_bin, "pip", "install", "--compile-bytecode", *extra_args, *specs], timeout=timeout, env=uv_env)
+                r = _run_installer([uv_bin, "pip", "install", "--compile-bytecode", *extra_args, *override_args, *specs], timeout=timeout, env=uv_env)
                 if r.returncode != 0:
                     logger.debug("uv pip install failed: %s", r.stderr)
                 # A uv resolver failure is authoritative: falling through to pip would discard uv
@@ -617,6 +637,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_
                 return _InstallResult(False, "", hint)
             except FileNotFoundError as e:  # uv vanished between lookup and spawn; it never evaluated the requirements
                 logger.debug("uv invocation failed: %s", e)
+        if overrides is not None:
+            return _InstallResult(False, "", "uv unavailable while project overrides are required; refusing plain-pip fallback")
         # Tier 2: python -m pip (ensurepip bootstrap if needed)
         pip_cmd = [sys.executable, "-m", "pip"]
         try:
@@ -637,6 +659,9 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300, constraint_
         if constraints is not None:
             with contextlib.suppress(OSError):
                 constraints.unlink()
+        if overrides is not None:
+            with contextlib.suppress(OSError):
+                overrides.unlink()
 
 
 def feature_missing(feature: str) -> tuple[str, ...]:
