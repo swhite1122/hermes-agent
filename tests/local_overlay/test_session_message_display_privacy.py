@@ -40,7 +40,7 @@ def test_session_messages_endpoint_sanitizes_nested_display_fields(monkeypatch):
     monkeypatch.setattr(
         web_server,
         "_open_session_db_for_profile",
-        lambda _profile, read_only=False: FakeDB(),
+        lambda _profile, **_kwargs: FakeDB(),
     )
 
     with TestClient(web_server.app) as client:
