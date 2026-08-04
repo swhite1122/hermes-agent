@@ -75,6 +75,7 @@ import site
 import subprocess
 import sys
 import sysconfig
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -777,6 +778,37 @@ def _warm_installed_bytecode(specs: tuple[str, ...], target: Optional[Path]) -> 
                 logger.debug("Bytecode warm skipped for %s: %s", root, exc)
 
 
+def _uv_project_overrides_file() -> Optional[Path]:
+    """Mirror trusted ``[tool.uv]`` overrides for ``uv pip install``.
+
+    The uv pip interface does not read project overrides automatically. Local
+    security overlays can therefore resolve in ``uv.lock`` but fail (or
+    downgrade a fixed package) during a later lazy install unless the same
+    overrides are passed explicitly.
+    """
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    try:
+        project_data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        overrides = project_data.get("tool", {}).get("uv", {}).get(
+            "override-dependencies", []
+        )
+        if not isinstance(overrides, list) or not all(
+            isinstance(item, str) and item.strip() for item in overrides
+        ):
+            raise ValueError("tool.uv.override-dependencies must be strings")
+        if not overrides:
+            return None
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="hermes-uv-overrides-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(overrides) + "\n")
+        return Path(path)
+    except Exception as e:
+        logger.debug("Could not build uv project overrides file: %s", e)
+        return None
+
+
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
@@ -798,6 +830,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
     target = _lazy_install_target()
     constraints: Optional[Path] = None
+    overrides = _uv_project_overrides_file()
 
     if target is not None:
         err = _ensure_target_ready(target)
@@ -812,6 +845,9 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     constraint_args: list[str] = []
     if constraints is not None:
         constraint_args = ["--constraint", str(constraints)]
+    override_args: list[str] = []
+    if overrides is not None:
+        override_args = ["--overrides", str(overrides)]
 
     try:
         venv_root = Path(sys.executable).parent.parent
@@ -841,8 +877,16 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 # the whole install; _warm_installed_bytecode below is the
                 # belt-and-braces pass for the spec's own roots on any tier.
                 r = subprocess.run(
-                    [uv_bin, "pip", "install", "--compile-bytecode",
-                     *target_args, *constraint_args, *specs],
+                    [
+                        uv_bin,
+                        "pip",
+                        "install",
+                        "--compile-bytecode",
+                        *target_args,
+                        *constraint_args,
+                        *override_args,
+                        *specs,
+                    ],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
@@ -865,6 +909,14 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 # In that narrow availability failure, the pip tier remains a
                 # valid fallback because uv never evaluated the requirements.
                 logger.debug("uv invocation failed: %s", e)
+
+        if overrides is not None:
+            return _InstallResult(
+                False,
+                "",
+                "uv failed while project dependency overrides were required; "
+                "refusing a plain-pip fallback that could downgrade core packages",
+            )
 
         # Tier 2: python -m pip (with ensurepip bootstrap if needed)
         pip_cmd = [sys.executable, "-m", "pip"]
@@ -909,6 +961,11 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         if constraints is not None:
             try:
                 constraints.unlink()
+            except OSError:
+                pass
+        if overrides is not None:
+            try:
+                overrides.unlink()
             except OSError:
                 pass
 
