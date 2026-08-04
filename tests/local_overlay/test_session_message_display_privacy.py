@@ -41,7 +41,7 @@ def test_session_messages_endpoint_sanitizes_nested_display_fields(monkeypatch):
     monkeypatch.setattr(
         sessions,
         "_open_session_db_for_profile",
-        lambda _profile, read_only=False: FakeDB(),
+        lambda _profile, **_kwargs: FakeDB(),
     )
 
     from hermes_cli import web_server
