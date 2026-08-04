@@ -69,6 +69,50 @@ class TestSpecSafety:
             f"expected {spec!r} to be rejected"
 
 
+class TestUvProjectOverrides:
+    def test_project_overrides_include_security_pin(self):
+        path = ld._uv_project_overrides_file()
+        assert path is not None
+        try:
+            overrides = path.read_text(encoding="utf-8").splitlines()
+        finally:
+            path.unlink(missing_ok=True)
+
+        assert "cryptography>=50,<51" in overrides
+
+    def test_lazy_uv_install_receives_project_overrides(self, monkeypatch, tmp_path):
+        override_file = tmp_path / "overrides.txt"
+        override_file.write_text("cryptography==50.0.0\n", encoding="utf-8")
+        commands = []
+
+        monkeypatch.setattr(ld, "_lazy_install_target", lambda: None)
+        monkeypatch.setattr(ld, "_uv_project_overrides_file", lambda: override_file)
+        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: "/managed/uv")
+        monkeypatch.setattr(
+            "tools.environments.local.hermes_subprocess_env", lambda **kwargs: {}
+        )
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return ld.subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+        result = ld._venv_pip_install(("alibabacloud-dingtalk==2.2.42",))
+
+        assert result.success is True
+        assert commands == [
+            [
+                "/managed/uv",
+                "pip",
+                "install",
+                "--overrides",
+                str(override_file),
+                "alibabacloud-dingtalk==2.2.42",
+            ]
+        ]
+        assert not override_file.exists()
+
+
 # ---------------------------------------------------------------------------
 # Allowlist enforcement
 # ---------------------------------------------------------------------------
