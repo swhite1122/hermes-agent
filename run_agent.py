@@ -947,7 +947,15 @@ class AIAgent(
         self._close_active_children(soft=True)
         # Retire (don't hard-close) the shared client: eviction runs on the gateway memory-manager thread,
         # and a cross-thread close can release TLS FDs under a still-unwinding worker.
-        _quietly(self._drop_shared_client, lambda c: self._retire_shared_openai_client(c, reason="cache_evict"))
+        def retire_or_close(client):
+            from agent.copilot_acp_client import CopilotACPClient
+
+            if isinstance(client, CopilotACPClient):
+                self._close_openai_client(client, reason="cache_evict", shared=True)
+            else:
+                self._retire_shared_openai_client(client, reason="cache_evict")
+
+        _quietly(self._drop_shared_client, retire_or_close)
         self._close_request_clients("cache_evict")
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
