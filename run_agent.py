@@ -5037,16 +5037,23 @@ class AIAgent:
         except Exception:
             pass
 
-        # Retire the OpenAI/httpx client to release sockets immediately.
-        # #70773: eviction runs on the gateway's memory-manager thread — a
-        # cross-thread hard close of the shared client can release TLS FDs
-        # under a still-unwinding worker (FD-recycle → SQLite corruption).
-        # Retirement shuts the pooled sockets down (the memory/socket win we
-        # want here) and lets GC release the FDs once no thread holds them.
+        # Retire normal shared HTTP clients without cross-thread FD release.
+        # ACP facades are different: they own a stdio subprocess, not a shared
+        # HTTP socket pool, so soft eviction must close them explicitly or a
+        # /model switch strands the adapter + SDK child pair.
         try:
             client = getattr(self, "client", None)
             if client is not None:
-                self._retire_shared_openai_client(client, reason="cache_evict")
+                from agent.copilot_acp_client import CopilotACPClient
+
+                if isinstance(client, CopilotACPClient):
+                    self._close_openai_client(
+                        client, reason="cache_evict", shared=True
+                    )
+                else:
+                    self._retire_shared_openai_client(
+                        client, reason="cache_evict"
+                    )
                 self.client = None
         except Exception:
             pass
