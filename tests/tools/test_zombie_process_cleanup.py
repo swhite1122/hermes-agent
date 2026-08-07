@@ -179,6 +179,37 @@ class TestAgentCloseMethod:
 
             mock_cleanup_cua.assert_not_called()
 
+    def test_soft_client_release_terminates_acp_subprocess(self):
+        """A /model cache eviction must not strand an ACP process pair."""
+        from unittest.mock import patch
+
+        from agent.copilot_acp_client import CopilotACPClient
+
+        proc = _spawn_sleep(60)
+        client = CopilotACPClient(acp_command=sys.executable)
+        with client._active_process_lock:
+            client._active_process = proc
+
+        try:
+            with patch("run_agent.AIAgent.__init__", return_value=None):
+                from run_agent import AIAgent
+
+                agent = AIAgent.__new__(AIAgent)
+                agent.session_id = "test-soft-release-acp"
+                agent._active_children = []
+                agent._active_children_lock = threading.Lock()
+                agent.client = client
+
+                agent.release_clients()
+
+            proc.wait(timeout=5)
+            assert proc.returncode is not None
+            assert agent.client is None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=1)
+
     def test_close_propagates_to_children(self):
         """close() should call close() on all active child agents."""
         from unittest.mock import MagicMock, patch
