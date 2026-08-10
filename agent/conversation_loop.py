@@ -1831,6 +1831,23 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _resolve_turn_max_iterations(agent) -> int:
+    """Return the global budget, optionally capped for a MoA council turn."""
+    try:
+        configured = max(1, int(agent.max_iterations))
+    except (TypeError, ValueError):
+        configured = 1
+    if getattr(agent, "provider", None) != "moa":
+        return configured
+    try:
+        moa_cap = int(
+            getattr(getattr(agent, "client", None), "max_iterations", 0) or 0
+        )
+    except (TypeError, ValueError):
+        moa_cap = 0
+    return min(configured, moa_cap) if moa_cap > 0 else configured
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1997,6 +2014,11 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    # Councils can have a much smaller per-turn budget than ordinary builds.
+    # Keep the global agent budget intact; the finalizer reads this turn-local
+    # value to trigger its existing tools-off synthesis fallback.
+    _turn_max_iterations = _resolve_turn_max_iterations(agent)
+    agent._active_turn_max_iterations = _turn_max_iterations
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2026,7 +2048,7 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (api_call_count < _turn_max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2883,7 +2905,7 @@ def run_conversation(
         thinking_spinner = None
         
         if not agent.quiet_mode:
-            agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
+            agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{_turn_max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
             agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
         else:
@@ -8644,10 +8666,10 @@ def run_conversation(
             # max_iterations now unlimited by default, a permanent failure
             # would otherwise spin forever and overwrite the rotated log
             # history within minutes (#92450).
-            _outer_error_cap = min(_MAX_OUTER_LOOP_ERRORS, max(1, agent.max_iterations))
+            _outer_error_cap = min(_MAX_OUTER_LOOP_ERRORS, max(1, _turn_max_iterations))
             if (
                 _is_local_processing_error
-                or api_call_count >= agent.max_iterations - 1
+                or api_call_count >= _turn_max_iterations - 1
                 or _outer_error_count >= _outer_error_cap
             ):
                 if _is_local_processing_error:

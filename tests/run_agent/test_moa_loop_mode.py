@@ -71,6 +71,64 @@ moa:
     assert calls[1]["tools"] is not None
 
 
+def test_forced_summary_reuses_existing_references(monkeypatch, tmp_path):
+    """The synthetic iteration-limit summary must not convene advisors again."""
+    from agent import moa_loop
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: review
+  presets:
+    review:
+      fanout: user_turn
+      reference_models:
+        - provider: openai-codex
+          model: advisor
+      aggregator:
+        provider: openrouter
+        model: aggregator
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    fanout_calls = []
+    aggregator_calls = []
+
+    def fake_fanout(*args, **kwargs):
+        fanout_calls.append((args, kwargs))
+        return [("openai-codex:advisor", "use the evidence", None)]
+
+    def fake_call_llm(**kwargs):
+        aggregator_calls.append(kwargs)
+        return _response("acted")
+
+    monkeypatch.setattr(moa_loop, "_run_references_parallel", fake_fanout)
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+    )
+
+    facade = moa_loop.MoAChatCompletions("review")
+    facade.create(messages=[{"role": "user", "content": "research this"}], tools=[])
+    facade.create(
+        messages=[
+            {"role": "user", "content": "research this"},
+            {"role": "assistant", "content": "working"},
+            {"role": "user", "content": "summarize now"},
+        ],
+        tools=[],
+        _moa_reuse_references=True,
+    )
+
+    assert len(fanout_calls) == 1
+    assert len(aggregator_calls) == 2
+
+
 def test_moa_runtime_provider_uses_virtual_endpoint():
     from hermes_cli.runtime_provider import resolve_runtime_provider
 

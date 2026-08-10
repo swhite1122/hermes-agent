@@ -1905,6 +1905,9 @@ class MoAChatCompletions:
 
     def create(self, **api_kwargs: Any) -> Any:
         prepared_request = api_kwargs.pop("_moa_prepared_request", None)
+        force_reuse_references = bool(
+            api_kwargs.pop("_moa_reuse_references", False)
+        )
         if prepared_request is not None:
             if not isinstance(prepared_request, dict):
                 raise TypeError("_moa_prepared_request must be a dict")
@@ -2085,6 +2088,11 @@ class MoAChatCompletions:
         # the fan-out runs once per user turn and iterations reuse the advice.
         _sig = _hash_messages(sig_messages)
         _cache_key = (self.preset_name, _sig, tuple(_slot_label(s) for s in reference_models))
+        if force_reuse_references and self._ref_cache_outputs:
+            # The iteration-limit summary is synthetic continuation of the
+            # same user turn. Reuse the advice already paid for instead of
+            # treating the summary nudge as a fresh council request.
+            _cache_key = self._ref_cache_key
         if _every_n_reuse:
             # Off-cadence every_n iteration: pin the key to the last
             # on-cadence run so the lookup below is a HIT and its guidance is
@@ -2317,7 +2325,14 @@ class MoAChatCompletions:
 
 
 class MoAClient:
-    def __init__(self, preset_name: str, reference_callback: Any = None, agent: Any = None):
+    def __init__(
+        self,
+        preset_name: str,
+        reference_callback: Any = None,
+        agent: Any = None,
+        max_iterations: int | None = None,
+    ):
+        self.max_iterations = max_iterations
         self.chat = type("_MoAChat", (), {})()
         self.chat.completions = MoAChatCompletions(
             preset_name, reference_callback=reference_callback, agent=agent,
@@ -2435,6 +2450,7 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
             pass
 
     resolved_preset = preset_name
+    moa_max_iterations = None
     if resolved_preset is None and getattr(agent, "provider", None) == "moa":
         resolved_preset = getattr(agent, "model", None)
 
@@ -2444,16 +2460,19 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
         from hermes_cli.moa_config import normalize_moa_config
 
         moa_cfg = normalize_moa_config(load_config().get("moa") or {})
+        moa_max_iterations = moa_cfg.get("max_iterations")
         presets = moa_cfg.get("presets") or {}
         if resolved_preset not in presets:
             resolved_preset = moa_cfg.get("default_preset") or "default"
     except Exception:
         resolved_preset = "default"
 
-    return MoAClient(
+    client = MoAClient(
         resolved_preset,
         reference_callback=_moa_reference_relay,
         # Thread the agent through so the reference fan-out wait can be
         # aborted on a user interrupt (see _run_references_parallel).
         agent=agent,
+        max_iterations=moa_max_iterations,
     )
+    return client

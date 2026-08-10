@@ -2641,6 +2641,26 @@ class TestHandleMaxIterations:
 
         assert agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60) == "Summary"
 
+    def test_summary_notice_uses_active_turn_cap(self, agent):
+        notices = []
+        agent._safe_print = notices.append
+        agent._active_turn_max_iterations = 6
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        assert agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 6) == "Summary"
+        assert any("maximum iterations (6)" in notice for notice in notices)
+
+    def test_moa_summary_requests_reference_reuse(self, agent):
+        agent.provider = "moa"
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        assert agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 6) == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        assert kwargs["_moa_reuse_references"] is True
+        assert "tools" not in kwargs
+
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
         agent.client.chat.completions.create.return_value = resp
