@@ -405,6 +405,11 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "default_preset": default_name,
         "active_preset": active_name,
         "presets": presets,
+        # Optional hard cap for each MoA acting turn. The normal agent budget
+        # can be intentionally large for builds, but a council multiplies the
+        # cost and context pressure of every acting iteration. None preserves
+        # the normal agent budget; a positive value bounds MoA only.
+        "max_iterations": _coerce_int_or_none(raw.get("max_iterations")),
         # Compatibility/flattened view for existing dashboard/desktop callers.
         "reference_models": deepcopy(active["reference_models"]),
         "aggregator": deepcopy(active["aggregator"]),
