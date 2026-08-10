@@ -1280,6 +1280,7 @@ class MoAChatCompletions:
 
     def create(self, **api_kwargs: Any) -> Any:
         prepared_request = api_kwargs.pop("_moa_prepared_request", None)
+        force_reuse_references = bool(api_kwargs.pop("_moa_reuse_references", False))
         if prepared_request is not None:
             if not isinstance(prepared_request, dict):
                 raise TypeError("_moa_prepared_request must be a dict")
@@ -1304,6 +1305,8 @@ class MoAChatCompletions:
 
         ref_messages = _reference_messages(messages)
         cache_key = self._fanout_cache_key(preset, ref_messages, reference_models)
+        if force_reuse_references and self._ref_cache_key is not None and self._ref_cache_outputs:
+            cache_key = self._ref_cache_key
         if cache_key == self._ref_cache_key and self._ref_cache_outputs:
             # HIT: already ran and accounted. Do NOT zero pending totals (a late
             # interrupted reference may have deposited) and no trace (not a new turn).
@@ -1330,7 +1333,9 @@ class MoAClient:
     """OpenAI-client-shaped wrapper: ``client.chat.completions`` is a ``MoAChatCompletions``;
     the accounting/trace surface below is delegated to that facade."""
 
-    def __init__(self, preset_name: str, reference_callback: Any = None, agent: Any = None):
+    def __init__(self, preset_name: str, reference_callback: Any = None, agent: Any = None,
+                 max_iterations: int | None = None):
+        self.max_iterations = max_iterations
         self.chat = type("_MoAChat", (), {})()
         self.chat.completions = MoAChatCompletions(preset_name, reference_callback=reference_callback, agent=agent)
 
@@ -1375,6 +1380,7 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
             )
 
     resolved_preset = preset_name
+    moa_max_iterations = None
     if resolved_preset is None and getattr(agent, "provider", None) == "moa":
         resolved_preset = getattr(agent, "model", None)
     resolved_preset = str(resolved_preset or "default")
@@ -1382,9 +1388,11 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
         from hermes_cli.config import load_config
         from hermes_cli.moa_config import normalize_moa_config
         moa_cfg = normalize_moa_config(load_config().get("moa") or {})
+        moa_max_iterations = moa_cfg.get("max_iterations")
         if resolved_preset not in (moa_cfg.get("presets") or {}):
             resolved_preset = moa_cfg.get("default_preset") or "default"
     except Exception:
         resolved_preset = "default"
     # ``agent`` lets the fan-out wait be aborted on a user interrupt.
-    return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=agent)
+    return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=agent,
+                     max_iterations=moa_max_iterations)

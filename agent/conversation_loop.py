@@ -1392,6 +1392,21 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _resolve_turn_max_iterations(agent) -> int:
+    """Return the global budget, optionally capped for a MoA council turn."""
+    try:
+        configured = max(1, int(agent.max_iterations))
+    except (TypeError, ValueError):
+        configured = 1
+    if getattr(agent, "provider", None) != "moa":
+        return configured
+    try:
+        moa_cap = int(getattr(getattr(agent, "client", None), "max_iterations", 0) or 0)
+    except (TypeError, ValueError):
+        moa_cap = 0
+    return min(configured, moa_cap) if moa_cap > 0 else configured
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1481,7 +1496,8 @@ def run_conversation(
             should_review_memory=s._should_review_memory,
         )
 
-    while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    agent._active_turn_max_iterations = _resolve_turn_max_iterations(agent)
+    while (s.api_call_count < agent._active_turn_max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)

@@ -55,6 +55,13 @@ def _coerce_reference_timeout(value: Any) -> float | None:
     return _coerce_number(value, float, DEFAULT_MOA_REFERENCE_TIMEOUT, positive=True)
 
 
+def _coerce_int_or_none(value: Any) -> int | None:
+    """Positive integer cap, or None when unset or invalid."""
+    if isinstance(value, bool):
+        return None
+    return _coerce_number(value, int, None, positive=True)
+
+
 def _coerce_fanout(value: Any) -> str:
     """Normalize the fan-out cadence to ``per_iteration`` | ``user_turn`` | ``every_n:<N>`` (N >= 2);
     the mapping form ``{mode: every_n, n: N}`` becomes the string, ``every_n:1`` collapses to
@@ -272,6 +279,11 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "default_preset": default_name,
         "active_preset": active_name,
         "presets": presets,
+        # Optional hard cap for each MoA acting turn. The normal agent budget
+        # can be intentionally large for builds, but a council multiplies the
+        # cost and context pressure of every acting iteration. None preserves
+        # the normal agent budget; a positive value bounds MoA only.
+        "max_iterations": _coerce_int_or_none(raw.get("max_iterations")),
         # Compatibility/flattened view for existing dashboard/desktop callers.
         **{key: deepcopy(presets[default_name][key]) for key in _FLAT_PRESET_KEYS},
         # MoA-level (not per-preset) toggle; see coerce_privacy_filter for the modes.
