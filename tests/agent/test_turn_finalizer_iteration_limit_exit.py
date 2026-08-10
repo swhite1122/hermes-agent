@@ -128,6 +128,23 @@ def _finalize(
 
 
 
+def test_moa_turn_cap_triggers_tolless_summary_before_global_limit(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=250, budget_remaining=244)
+    setattr(agent, "_active_turn_max_iterations", 6)
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=6,
+    )
+
+    assert agent._handle_max_iterations_called is True
+    assert result["final_response"] == "summary from extra call"
+    assert result["turn_exit_reason"] == "max_iterations_reached(6/6)"
+
+
 @pytest.mark.parametrize(
     ("exit_reason", "interrupted", "failed"),
     [
