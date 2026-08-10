@@ -2918,8 +2918,12 @@ def try_activate_fallback(
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    turn_max_iterations = int(
+        getattr(agent, "_active_turn_max_iterations", agent.max_iterations)
+        or agent.max_iterations
+    )
     agent._safe_print(
-        f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+        f"⚠️  Reached maximum iterations ({turn_max_iterations}). Requesting summary..."
     )
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
@@ -3078,6 +3082,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 "model": agent.model,
                 "messages": api_messages,
             }
+            if agent.provider == "moa":
+                # This user message is a synthetic continuation, not a new
+                # council turn. Reuse the current turn's advisor cache while
+                # making the aggregator-only, tools-off final synthesis.
+                summary_kwargs["_moa_reuse_references"] = True
             if _summary_temperature is not None:
                 summary_kwargs["temperature"] = _summary_temperature
             if agent.max_tokens is not None:
@@ -3249,7 +3258,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        final_response = f"I reached the maximum iterations ({turn_max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
         from agent import relay_llm
 
