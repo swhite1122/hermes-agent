@@ -2258,6 +2258,11 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     # The summary now carries ``tools``; on cache-planned routes the main loop scrubbed a deep
     # copy, so ``agent.tools`` may still hold bytes the provider 400s on.
     sanitize_outbound_kwargs(agent, summary_kwargs)
+    if agent.provider == "moa":
+        # The summary nudge reuses council advice for tools-off synthesis.
+        summary_kwargs.pop("tools", None)
+        summary_kwargs.pop("tool_choice", None)
+        summary_kwargs["_moa_reuse_references"] = True
 
     def _attempt(retry_count: int) -> str:
         summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry" if retry_count else "iteration_limit_summary")
@@ -2274,7 +2279,8 @@ _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthrop
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    turn_max_iterations = int(getattr(agent, "_active_turn_max_iterations", agent.max_iterations) or agent.max_iterations)
+    warning = f"⚠️  Reached maximum iterations ({turn_max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
         # NOT the gate — the interactive CLI runs quiet_mode=True by default and must see this.
@@ -2314,7 +2320,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         from agent.turn_failure_copy import site_copy
-        final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
+        final_response = site_copy("max_iterations_no_summary", limit=turn_max_iterations)
     finally:
         from agent import relay_llm
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
