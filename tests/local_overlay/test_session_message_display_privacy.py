@@ -22,6 +22,7 @@ def test_session_messages_endpoint_sanitizes_nested_display_fields(monkeypatch):
             limit=None,
             offset=0,
             latest=False,
+            include_compacted=False,
         ):
             assert limit == 500
             assert latest is True
