@@ -572,7 +572,13 @@ class CopilotACPClient:
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
-        self._acp_args = list(acp_args or args or _resolve_args())
+        if acp_args is not None:
+            resolved_args = acp_args
+        elif args is not None:
+            resolved_args = args
+        else:
+            resolved_args = _resolve_args()
+        self._acp_args = list(resolved_args)
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False

@@ -127,6 +127,17 @@ def _client(tmp_path: Path, mode: str = "normal"):
     return client, log
 
 
+def test_default_adapter_transport_preserves_empty_argument_list(tmp_path):
+    from agent.claude_acp_client import ClaudeACPClient
+
+    client = ClaudeACPClient(
+        acp_command="claude-agent-acp",
+        acp_cwd=str(tmp_path),
+    )
+
+    assert client._acp_args == []
+
+
 def _requests(log: Path) -> list[dict]:
     if not log.exists():
         return []
