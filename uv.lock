@@ -90,6 +90,7 @@ nemo-relay = false
 requests = false
 httplib2 = false
 httpx = false
+tornado = false
 pyasn1 = false
 snowballstemmer = false
 concurrent-log-handler = false
@@ -1889,6 +1890,7 @@ messaging = [
     { name = "qrcode" },
     { name = "slack-bolt" },
     { name = "slack-sdk" },
+    { name = "tornado" },
 ]
 mistral = [
     { name = "mistralai" },
@@ -1925,6 +1927,7 @@ termux = [
     { name = "mcp" },
     { name = "python-telegram-bot", extra = ["webhooks"] },
     { name = "starlette" },
+    { name = "tornado" },
 ]
 termux-all = [
     { name = "agent-client-protocol" },
@@ -1942,6 +1945,7 @@ termux-all = [
     { name = "python-multipart" },
     { name = "python-telegram-bot", extra = ["webhooks"] },
     { name = "starlette" },
+    { name = "tornado" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 tts-premium = [
@@ -2122,6 +2126,8 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'web'", specifier = "==1.3.1" },
     { name = "supermemory", marker = "extra == 'supermemory'", specifier = "==3.50.0" },
     { name = "tenacity", specifier = "==9.1.4" },
+    { name = "tornado", marker = "extra == 'messaging'", specifier = "==6.5.8" },
+    { name = "tornado", marker = "extra == 'termux'", specifier = "==6.5.8" },
     { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.21" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = "==2025.3" },
     { name = "urllib3", specifier = ">=2.7.0,<3" },
