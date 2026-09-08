@@ -209,6 +209,15 @@ def test_nested_fences_across_every_chunk_split():
         assert scrubber.feed(text[:split]) + scrubber.feed(text[split:]) + scrubber.flush() == "before  after"
 
 
+def test_flush_preserves_generic_incomplete_markup_only_outside_memory():
+    for tail in ("<", "<m", "<me", "<mem", "<MEM", "<memory", "< memory", "<div"):
+        scrubber = MemoryContextScrubber()
+        assert scrubber.feed("plain " + tail) + scrubber.flush() == "plain " + tail
+        scrubber = MemoryContextScrubber()
+        assert scrubber.feed("<memory-context>private" + tail) + scrubber.flush() == ""
+        assert scrubber.feed("next turn") + scrubber.flush() == "next turn"
+
+
 def test_literal_less_than_cannot_swallow_memory_opener():
     scrubber = MemoryContextScrubber()
     assert scrubber.feed("x < y <memory-context>private</memory-context> end") + scrubber.flush() == "x < y  end"
