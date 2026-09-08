@@ -35,19 +35,6 @@ class MemoryContextScrubber:
             and "not new user input" in lowered
         )
 
-    @staticmethod
-    def _looks_sensitive_prefix(token: str) -> bool:
-        compact = "".join(token.lower().split())
-        open_tag = "<memory-context>"
-        close_tag = "</memory-context>"
-        return (
-            open_tag.startswith(compact)
-            or close_tag.startswith(compact)
-            or compact.startswith("<memory-context")
-            or compact.startswith("</memory-context")
-            or compact.startswith("[systemnote:")
-        )
-
     def feed(self, text: str) -> str:
         buffer = self._buffer + str(text or "")
         self._buffer = ""
@@ -107,9 +94,7 @@ class MemoryContextScrubber:
 
     def flush(self) -> str:
         tail, self._buffer = self._buffer, ""
-        if tail in {"<", "<m", "<memo", "<memory"}:
-            return tail
-        if self._depth or self._looks_sensitive_prefix(tail):
+        if self._depth or self._is_memory_note(tail):
             self._depth = 0
             return ""
         return tail
