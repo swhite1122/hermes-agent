@@ -239,7 +239,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
         messages.append(msg)
-    return messages
+    # History remains raw for resume/export. This is the display-only RPC projection.
+    return _sanitize_display_value(messages)
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:

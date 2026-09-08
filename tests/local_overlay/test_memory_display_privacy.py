@@ -110,6 +110,54 @@ def test_history_sanitizes_content_and_reasoning_fields():
     assert "private" not in rendered
 
 
+def test_history_sanitizes_tool_args_derived_context_and_display_metadata():
+    leaked = "visible <memory-context>private</memory-context> after"
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "lookup", "arguments": json.dumps({"query": leaked})},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "tool result",
+        },
+        {
+            "role": "assistant",
+            "content": "visible reply",
+            "display_metadata": {"nested": {"context": leaked}},
+        },
+    ]
+
+    messages = server._history_to_messages(history)
+    rendered = json.dumps(messages)
+
+    assert history[0]["tool_calls"][0]["function"]["arguments"] == json.dumps({"query": leaked})
+    assert history[2]["display_metadata"]["nested"]["context"] == leaked
+    assert "visible" in rendered and " after" in rendered
+    assert "memory-context" not in rendered.lower()
+    assert "private" not in rendered
+
+
+def test_flush_preserves_benign_incomplete_markup_at_eof():
+    for incomplete in ("<", "<m", "<memo", "<memory"):
+        scrubber = MemoryContextScrubber()
+        assert scrubber.feed(f"visible {incomplete}") + scrubber.flush() == f"visible {incomplete}"
+
+
+def test_display_sanitizer_strips_spaced_recalled_memory_note_only(monkeypatch):
+    monkeypatch.setattr(display_sanitizer, "_shared_sanitize", None)
+    recalled = "[ System note: recalled memory context, NOT new user input ]"
+    generic = "[ System note: ordinary display note ]"
+
+    assert sanitize_display_text(f"before {recalled} after") == "before  after"
+    assert sanitize_display_text(f"before {generic} after") == f"before {generic} after"
+
+
 def test_recursive_display_sanitizer_sanitizes_dictionary_keys():
     payload = {
         "reasoning_details": {

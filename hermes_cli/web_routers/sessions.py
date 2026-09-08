@@ -220,7 +220,8 @@ def get_sessions(
                 s["pinned"] = bool(s.get("pinned"))
             if not full:
                 _strip_session_list_rows(sessions)
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+            return sanitize_display_value(
+                {"sessions": sessions, "total": total, "limit": limit, "offset": offset})
         finally:
             db.close()
     except HTTPException:
@@ -485,7 +486,7 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
         # clients resolve them to whichever gateway happened to be active.
         session["profile"] = _serving_profile(profile)
         session["is_default_profile"] = session["profile"] == "default"
-        return session
+        return sanitize_display_value(session)
 
     return _with_db(profile, _detail, read_only=True)
 
