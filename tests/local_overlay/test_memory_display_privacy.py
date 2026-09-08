@@ -123,3 +123,44 @@ def test_recursive_display_sanitizer_sanitizes_dictionary_keys():
     assert sanitized == {"reasoning_details": {"": "visible value"}}
     assert "memory-context" not in rendered.lower()
     assert "key-private" not in rendered
+
+
+def test_display_scrubber_tracks_nested_exact_fences_to_the_outer_close():
+    scrubber = MemoryContextScrubber()
+
+    rendered = scrubber.feed(
+        "before <memory-context>outer <memory-context>inner</memory-context> "
+        "outer</memory-context> after"
+    ) + scrubber.flush()
+
+    assert rendered == "before  after"
+
+
+def test_turn_finish_discards_dangling_memory_fence_and_resets_stream_state():
+    server._sessions["boundary-test"] = {}
+    try:
+        server._event_frame("message.delta", "boundary-test", {"text": "visible <memory-context>private tail"})
+        server._event_frame("message.complete", "boundary-test", {"text": "visible"})
+        frame = server._event_frame("message.delta", "boundary-test", {"text": "next turn visible"})
+        assert frame["params"]["payload"]["text"] == "next turn visible"
+    finally:
+        server._sessions.pop("boundary-test", None)
+
+
+def test_event_payload_dictionary_keys_are_display_only_sanitized():
+    raw = {"<memory-context>private-key</memory-context>": "visible"}
+    frame = server._event_frame("tool.start", "key-test", raw)
+    assert frame["params"]["payload"] == {"": "visible"}
+    assert "private-key" in next(iter(raw))
+
+
+def test_nested_fences_across_every_chunk_split():
+    text = "before <memory-context>outer <MEMORY-CONTEXT>inner</memory-context> outer</MEMORY-CONTEXT> after"
+    for split in range(len(text) + 1):
+        scrubber = MemoryContextScrubber()
+        assert scrubber.feed(text[:split]) + scrubber.feed(text[split:]) + scrubber.flush() == "before  after"
+
+
+def test_literal_less_than_cannot_swallow_memory_opener():
+    scrubber = MemoryContextScrubber()
+    assert scrubber.feed("x < y <memory-context>private</memory-context> end") + scrubber.flush() == "x < y  end"

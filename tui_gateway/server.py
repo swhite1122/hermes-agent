@@ -639,7 +639,8 @@ def _sanitize_display_payload_value(
         return [_sanitize_display_payload_value(item, event=event, sid=sid, path=path + (index,))
                 for index, item in enumerate(value)]
     if isinstance(value, dict):
-        return {key: _sanitize_display_payload_value(item, event=event, sid=sid, path=path + (key,))
+        return {_display_text(key) if isinstance(key, str) else key:
+                _sanitize_display_payload_value(item, event=event, sid=sid, path=path + (key,))
                 for key, item in value.items()}
     return value
 
@@ -668,6 +669,10 @@ def _sanitize_display_event_payload(event: str, sid: str, payload: dict | None) 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     payload = _sanitize_display_event_payload(event, sid, payload)
+    if event == "message.complete":
+        session = _sessions.get(sid)
+        if isinstance(session, dict):
+            session.pop("display_event_scrubbers", None)
     params: dict = {"type": event, "session_id": sid, **({"payload": payload} if payload is not None else {})}
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
