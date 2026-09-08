@@ -88,6 +88,21 @@ class TestIsSafePath:
 
 
 class TestGuessCategory:
+    def test_scratch_project_tests_and_empty_dirs_are_not_disposable(self, _isolate_env):
+        dg = _load_lib()
+        project = _isolate_env / "scratch" / "zoey" / "project"
+        project.mkdir(parents=True)
+        p = project / "test_regression.py"
+        p.write_text("assert True")
+        empty = project / "assets"
+        empty.mkdir()
+        assert dg.guess_category(p) is None
+        # Simulate a stale entry queued by the pre-update plugin.
+        assert dg.track(str(p), "test", silent=True)
+        assert dg.dry_run()[0] == []
+        assert dg.quick()["deleted"] == 0
+        assert p.exists() and empty.exists()
+
     def test_test_prefix(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "test_foo.py"
