@@ -27,6 +27,8 @@ class MemoryContextScrubber:
     @staticmethod
     def _is_memory_note(token: str) -> bool:
         lowered = " ".join(token.lower().split())
+        if lowered.startswith("["):
+            lowered = "[" + lowered[1:].lstrip()
         return (
             lowered.startswith("[system note:")
             and "recalled memory context" in lowered
@@ -105,6 +107,8 @@ class MemoryContextScrubber:
 
     def flush(self) -> str:
         tail, self._buffer = self._buffer, ""
+        if tail in {"<", "<m", "<memo", "<memory"}:
+            return tail
         if self._depth or self._looks_sensitive_prefix(tail):
             self._depth = 0
             return ""
