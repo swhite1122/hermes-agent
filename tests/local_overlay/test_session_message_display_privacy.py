@@ -1,8 +1,17 @@
 """Regression test for Desktop REST transcript display privacy."""
 
+from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from hermes_cli.web_routers import sessions
+
+
+def display_client():
+    # Test the real router without starting unrelated cron/DB maintenance threads.
+    app = FastAPI()
+    app.include_router(sessions.list_router)
+    app.include_router(sessions.manage_router)
+    return TestClient(app)
 
 
 def test_session_messages_endpoint_sanitizes_nested_display_fields(monkeypatch):
@@ -44,9 +53,7 @@ def test_session_messages_endpoint_sanitizes_nested_display_fields(monkeypatch):
         lambda _profile, **_kwargs: FakeDB(),
     )
 
-    from hermes_cli import web_server
-    with TestClient(web_server.app) as client:
-        client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+    with display_client() as client:
         response = client.get("/api/sessions/session-1/messages")
 
     assert response.status_code == 200
@@ -83,9 +90,7 @@ def test_session_detail_and_list_sanitize_titles_and_metadata(monkeypatch):
     )
     monkeypatch.setattr(sessions, "_maybe_auto_archive_for_profile", lambda _profile: None)
 
-    from hermes_cli import web_server
-    with TestClient(web_server.app) as client:
-        client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+    with display_client() as client:
         detail = client.get("/api/sessions/session-1")
         listing = client.get("/api/sessions?limit=20")
 
