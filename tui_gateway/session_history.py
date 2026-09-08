@@ -215,7 +215,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             for key in _HISTORY_ASSISTANT_DETAIL_KEYS
             if role == "assistant" and key in m and m.get(key) is not None
         }
-        has_assistant_detail = bool(reasoning)
+        has_assistant_detail = any(reasoning.values())
         if not content_text.strip() and not has_assistant_detail:
             continue
         msg = {"role": role, "text": content_text}
