@@ -9,7 +9,7 @@ class MemoryContextScrubber:
     """Strip memory-context spans and recalled-memory notes across chunks."""
 
     def __init__(self) -> None:
-        self._inside = False
+        self._depth = 0
         self._buffer = ""
 
     @staticmethod
@@ -52,7 +52,7 @@ class MemoryContextScrubber:
         visible: list[str] = []
 
         while buffer:
-            if self._inside:
+            if self._depth:
                 token_start = buffer.find("<")
                 if token_start < 0:
                     return "".join(visible)
@@ -66,6 +66,15 @@ class MemoryContextScrubber:
                 visible.append(buffer[:token_start])
                 buffer = buffer[token_start:]
 
+            # A literal delimiter must not swallow a later memory opener.
+            end = buffer.find(">" if buffer.startswith("<") else "]")
+            next_open = buffer.find("<", 1)
+            if next_open >= 0 and (end < 0 or next_open < end):
+                if not self._depth:
+                    visible.append(buffer[:next_open])
+                buffer = buffer[next_open:]
+                continue
+
             if buffer.startswith("<"):
                 token_end = buffer.find(">")
                 if token_end < 0:
@@ -73,11 +82,11 @@ class MemoryContextScrubber:
                     break
                 token = buffer[: token_end + 1]
                 kind = self._tag_kind(token)
-                if self._inside:
+                if kind == "open":
+                    self._depth += 1
+                elif self._depth:
                     if kind == "close":
-                        self._inside = False
-                elif kind == "open":
-                    self._inside = True
+                        self._depth -= 1
                 elif kind != "close":
                     visible.append(token)
                 buffer = buffer[token_end + 1 :]
@@ -96,8 +105,8 @@ class MemoryContextScrubber:
 
     def flush(self) -> str:
         tail, self._buffer = self._buffer, ""
-        if self._inside or self._looks_sensitive_prefix(tail):
-            self._inside = False
+        if self._depth or self._looks_sensitive_prefix(tail):
+            self._depth = 0
             return ""
         return tail
 
