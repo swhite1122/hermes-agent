@@ -85,7 +85,7 @@ _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "logs", "memories", "sessions", "cron", "cronjobs",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
     "hermes-agent", "backups", "profiles", ".worktrees",
-    "patches", "projects", "skins", "themes", "contributors"})
+    "patches", "projects", "scratch", "skins", "themes", "contributors"})
 
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
     ".git", "node_modules", "venv", ".venv", "site-packages", "__pycache__"})
@@ -99,7 +99,7 @@ _NEVER_TRACK_TOP_LEVEL = frozenset({
     # User-authored project trees — never sweep empty directories inside these (#75403).
     # User-authored and project trees — never auto-delete files inside these just because they happen to be
     # named test_* or tmp_* (#75403, also #32164, #37721).
-    "patches", "projects", "skins", "themes", "contributors",
+    "patches", "projects", "scratch", "skins", "themes", "contributors",
     "profiles", "backups", "optional-skills"})
 
 @functools.lru_cache(maxsize=1)  # built lazily so HERMES_HOME resolves once
@@ -213,7 +213,7 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
     for item, p, age in _live_items(load_tracked(), datetime.now(timezone.utc)):
         cat = item["category"]
         # Stale cron-output entries are skipped by quick(); omit them here too.
-        if cat == "cron-output" and guess_category(p) != "cron-output":
+        if cat in _STALE_SKIP_NOTE and guess_category(p) != cat:
             continue
         if _is_auto_delete(cat, age):
             auto.append(item)
