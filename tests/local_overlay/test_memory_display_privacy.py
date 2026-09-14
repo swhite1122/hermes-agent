@@ -60,12 +60,14 @@ def test_emit_sanitizes_interleaved_nested_delta_paths(monkeypatch):
         server._emit(
             "message.delta",
             "sid",
-            {"text": "left <memory-context>left private"},
+            {"text": "left <memory-context>left private",
+             "rendered": "right < memory-context >right private"},
         )
         server._emit(
             "message.delta",
             "sid",
-            {"text": "</memory-context> left after < memory-context >still private"},
+            {"text": "</memory-context> left after < memory-context >still private",
+             "rendered": "</ memory-context > right after"},
         )
         server._emit(
             "tool.start",
@@ -79,6 +81,7 @@ def test_emit_sanitizes_interleaved_nested_delta_paths(monkeypatch):
 
         rendered = json.dumps(emitted)
         assert "left after" in rendered
+        assert "right after" in rendered
         assert "ok " in rendered and " done" in rendered
         assert "memory-context" not in rendered.lower()
         assert "private" not in rendered
