@@ -233,6 +233,11 @@ SKILLS_GUIDANCE = (
     "remaining `[SKILL_PRUNED]` markers for that same skill; they are historical artifacts of earlier compactions."
 )
 
+def kanban_worker_guidance(tool_names) -> str:
+    """Resolve worker-only instructions once; board access is not assignment."""
+    return KANBAN_GUIDANCE if os.getenv("HERMES_KANBAN_TASK") and "kanban_show" in tool_names else ""
+
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from the shared board at `~/.hermes/kanban.db`. Your task id is in "

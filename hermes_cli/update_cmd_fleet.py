@@ -146,7 +146,8 @@ def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
     """Require current successors for every recorded runtime, not just any live row.
 
     A PID changes on restart; the stable identity is (runtime kind, profile).
-    The gateway matrix cannot vouch for serve/dashboard or unidentified runtimes.
+    The gateway matrix cannot vouch for serve/dashboard in the same boot.
+    A later boot retires those pre-boot modules, but gateways must still be current.
     Keep the historical receipt intact: a manual restart is not a successful update.
     """
     if not expected_sha:
@@ -158,6 +159,16 @@ def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
         plan = receipt.get("plan") or {}
         runtimes = plan.get("runtimes") or []
         recorded_fleet = receipt.get("fleet") or []
+        # A completed pre-boot update cannot have surviving dashboard/serve
+        # modules. Preserve the receipt and still verify every live gateway.
+        rebooted = False
+        if receipt.get("finished_at"):
+            from datetime import datetime
+            import psutil
+
+            with suppress(ValueError, TypeError, OSError):
+                finished = datetime.fromisoformat(receipt["finished_at"])
+                rebooted = finished.tzinfo is not None and finished.timestamp() < psutil.boot_time()
         owed = set()
         entries: list[tuple[object, str | None]] = [(entry, None) for entry in runtimes]
         entries.extend((entry, "gateway") for entry in recorded_fleet)
@@ -166,6 +177,8 @@ def _live_fleet_covers_receipt(expected_sha: str | None) -> bool:
                 return False
             kind = entry.get("kind", default_kind)
             profile = entry.get("profile")
+            if rebooted and kind in {"dashboard", "serve"} and profile and profile != "unknown":
+                continue
             if kind != "gateway" or not profile or profile == "unknown":
                 return False
             owed.add((kind, profile))
