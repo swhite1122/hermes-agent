@@ -2697,7 +2697,7 @@ class TestHandleMaxIterations:
 
     def test_summary_notice_uses_active_turn_cap(self, agent):
         notices = []
-        agent._safe_print = notices.append
+        agent._safe_print = lambda text, **kwargs: notices.append(text)
         agent._active_turn_max_iterations = 6
         agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
         agent._cached_system_prompt = "You are helpful."

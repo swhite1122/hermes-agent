@@ -42,6 +42,7 @@ dependencies = [
   "python-dotenv==1.2.2",
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
+  "anyio==4.14.2",  # GHSA-82r6-8w77-94w6 / GHSA-5p39-cfhj-2xmp
   "rich==14.3.3",
   "tenacity==9.1.4",
   "pyyaml==6.0.3",
@@ -503,6 +504,7 @@ aiohttp-socks = false
 aiosqlite = false
 alibabacloud-dingtalk = false
 anthropic = false
+anyio = false
 asyncpg = false
 azure-identity = false
 boto3 = false
